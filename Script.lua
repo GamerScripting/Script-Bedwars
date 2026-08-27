@@ -181,10 +181,12 @@ local function callVerify(key, hwid)
 end
 
 --  Fuehrt aus, was der Server geschickt hat. Die Markierung (w) wird
---  vorangestellt, damit eine geleakte Kopie ihre Herkunft mitfuehrt.
+--  ANGEHAENGT, nicht vorangestellt: das Skript beginnt mit --!nocheck und
+--  --!nolint, und diese Direktiven gelten bei Luau nur, wenn sie ganz oben
+--  stehen. Eine Zeile davor wuerde sie still aushebeln.
 local function runPayload(result)
 	if type(result.p) ~= "string" or result.p == "" then return false, "no_payload" end
-	local source = (type(result.w) == "string" and result.w or "") .. b64decode(result.p)
+	local source = b64decode(result.p) .. "\n" .. (type(result.w) == "string" and result.w or "")
 	local chunk, err = loadstring(source)
 	if not chunk then
 		warn("[KitDisplay] payload failed to compile: " .. tostring(err))
