@@ -26,6 +26,12 @@ local REASONS = {
 	rate_limited  = "Too many attempts. Wait a few minutes.",
 	bad_request   = "Internal error, please try again.",
 	no_payload    = "Server is not serving the script right now.",
+	too_many_nets = "This key is being used from too many networks.",
+	bad_user      = "Roblox account could not be verified.",
+	no_session    = "Session expired - the key was used elsewhere.",
+	out_of_order  = "Download interrupted. Run the script again.",
+	chunk_failed  = "Download failed. Run the script again.",
+	network       = "Server unreachable during download.",
 }
 
 local function guiParent()
@@ -180,16 +186,60 @@ local function callVerify(key, hwid)
 	return decoded
 end
 
---  Fuehrt aus, was der Server geschickt hat. Die Markierung (w) wird
---  ANGEHAENGT, nicht vorangestellt: das Skript beginnt mit --!nocheck und
---  --!nolint, und diese Direktiven gelten bei Luau nur, wenn sie ganz oben
---  stehen. Eine Zeile davor wuerde sie still aushebeln.
-local function runPayload(result)
-	if type(result.p) ~= "string" or result.p == "" then return false, "no_payload" end
-	local source = b64decode(result.p) .. "\n" .. (type(result.w) == "string" and result.w or "")
-	local chunk, err = loadstring(source)
+--  Hex-Sitzungsschluessel zu Bytes, dann Teil fuer Teil zuruecksrechnen.
+local function xorWithHexKey(data, hexKey)
+	local key, n = {}, 0
+	for byte in hexKey:gmatch("%x%x") do
+		n = n + 1
+		key[n] = tonumber(byte, 16)
+	end
+	if n == 0 then return data end
+	local out = {}
+	for i = 1, #data do
+		out[i] = string.char(bit32.bxor(string.byte(data, i), key[((i - 1) % n) + 1]))
+	end
+	return table.concat(out)
+end
+
+--  Holt die Payload in Teilen. Der Server gibt sie nur der Reihe nach und
+--  jeden Teil nur einmal heraus - bricht das ab, ist die Sitzung tot und
+--  es muss neu verifiziert werden.
+local function fetchPayload(session)
+	local parts = {}
+	for i = 0, session.n - 1 do
+		local res = httpRequest({
+			Url     = WORKER_URL .. "/chunk",
+			Method  = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body    = HttpService:JSONEncode({ sid = session.sid, i = i }),
+		})
+		if not res or not res.Body then return nil, "network" end
+		local ok, decoded = pcall(function() return HttpService:JSONDecode(res.Body) end)
+		if not ok or type(decoded) ~= "table" or not decoded.ok then
+			return nil, (type(decoded) == "table" and decoded.reason) or "chunk_failed"
+		end
+		parts[#parts + 1] = xorWithHexKey(b64decode(decoded.d), session.sk)
+	end
+	return table.concat(parts)
+end
+
+--  Die Markierung (w) wird ANGEHAENGT, nicht vorangestellt: das Skript
+--  beginnt mit --!nocheck und --!nolint, und diese Direktiven gelten bei
+--  Luau nur, wenn sie ganz oben stehen. Eine Zeile davor wuerde sie still
+--  aushebeln.
+local function runPayload(session)
+	if type(session.sid) ~= "string" or type(session.sk) ~= "string"
+		or type(session.n) ~= "number" then
+		return false, "no_payload"
+	end
+
+	local b64, err = fetchPayload(session)
+	if not b64 then return false, err end
+
+	local source = b64decode(b64) .. "\n" .. (type(session.w) == "string" and session.w or "")
+	local chunk, cerr = loadstring(source)
 	if not chunk then
-		warn("[KitDisplay] payload failed to compile: " .. tostring(err))
+		warn("[KitDisplay] payload failed to compile: " .. tostring(cerr))
 		return false, "compile_error"
 	end
 	local ok, runErr = pcall(chunk)
@@ -294,8 +344,14 @@ local function showKeyPrompt(hwid, prefill, message)
 			end
 			if result.ok then
 				saveAuth({ key = key })
-				gui:Destroy()
-				runPayload(result)
+				status.Text = "Downloading..."
+				local ran, why = runPayload(result)
+				if ran then
+					gui:Destroy()
+				else
+					status.TextColor3 = Color3.fromRGB(235, 120, 120)
+					status.Text       = REASONS[why] or ("Failed: " .. tostring(why))
+				end
 			else
 				status.TextColor3 = Color3.fromRGB(235, 120, 120)
 				status.Text       = REASONS[result.reason] or ("Error: " .. tostring(result.reason))
@@ -337,7 +393,11 @@ local function main()
 			return
 		end
 		if result.ok then
-			runPayload(result)
+			local ran, why = runPayload(result)
+			if not ran then
+				showToast(REASONS[why] or ("Failed: " .. tostring(why)),
+					Color3.fromRGB(235, 120, 120), 6)
+			end
 			return
 		end
 		showKeyPrompt(hwid, auth.key, REASONS[result.reason] or "Please confirm your key.")
