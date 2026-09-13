@@ -1,5 +1,5 @@
 {
-  "version": "1.0.5",
+  "version": "1.0.6",
   "url": "https://github.com/GamerScripting/Script-Bedwars/releases/latest/download/StreamproofOverlay.zip",
-  "notes": "Wichtig: die Aufnahme-Apps-Liste war in JEDER bisherigen Release-Fassung leer/unlesbar, nicht nur bei einzelnen Rechnern - eine Obfuscar-Einstellung hat die Datenbindung der Liste kaputtgemacht, jetzt behoben."
+  "notes": "Wichtig: vollautomatische Updates (seit 1.0.4) wieder zurueckgenommen - konnte in einen Neustart-Kreislauf ohne Bremse laufen (App geht staendig auf und zu). Updates werden wieder nur GESUCHT, 'Update installieren' im Bedienfenster bleibt der Weg zum Einspielen."
 }
