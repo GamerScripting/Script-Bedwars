@@ -1,0 +1,24 @@
+{
+  "_hinweis": [
+    "Zusatzliste der Aufnahme-Programme. Das Overlay laedt sie beim Start und",
+    "traegt ein, was es noch nicht kennt - die eingebaute Liste wird dabei NIE",
+    "ueberschrieben, nur ergaenzt. So laesst sich ein neuer Recorder abdecken,",
+    "ohne eine neue Programmversion zu bauen.",
+    "",
+    "Schluessel ist der Prozessname, klein und ohne .exe. Im Zweifel im",
+    "Task-Manager unter 'Details' nachsehen - dort steht er genau so."
+  ],
+  "apps": {
+    "obs64": { "name": "OBS Studio", "why": "Streaming / Aufnahme" },
+    "streamlabs desktop": { "name": "Streamlabs Desktop", "why": "Streaming" },
+    "medal": { "name": "Medal", "why": "Clips" },
+    "nvidia share": { "name": "NVIDIA Share", "why": "ShadowPlay / Instant Replay" },
+    "gamebar": { "name": "Xbox Game Bar", "why": "Aufnahme" },
+    "snippingtool": { "name": "Snipping Tool", "why": "Screenshots" },
+    "screenclippinghost": { "name": "Ausschneiden und skizzieren", "why": "Screenshots" },
+    "vencorddesktop": { "name": "Vencord Desktop", "why": "Screenshare" },
+    "equibop": { "name": "Equibop", "why": "Screenshare" },
+    "armcord": { "name": "ArmCord", "why": "Screenshare" },
+    "goodbyedpi": { "name": "Beispiel-Eintrag", "why": "hier kannst du eigene ergaenzen" }
+  }
+}
