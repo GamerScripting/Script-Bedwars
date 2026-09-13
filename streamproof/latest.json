@@ -1,5 +1,5 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "url": "https://github.com/GamerScripting/Script-Bedwars/releases/latest/download/StreamproofOverlay.zip",
-  "notes": "Die drei Tab-Reiter neben dem gerade ausgewaehlten waren praktisch unsichtbar (helle Schrift auf hellem Systemhintergrund) - jetzt immer lesbar."
+  "notes": "Spaltenkoepfe der Aufnahme-Apps-Liste (can see/Program/Status/...) waren ebenfalls kaum lesbar - gleiche Ursache wie die Tab-Reiter. Dazu: die Status-Spalte war immer deutsch, auch im EN-Modus."
 }
