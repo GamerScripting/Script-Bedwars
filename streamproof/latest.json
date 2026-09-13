@@ -1,5 +1,5 @@
 {
-  "version": "1.0.3",
+  "version": "1.0.4",
   "url": "https://github.com/GamerScripting/Script-Bedwars/releases/latest/download/StreamproofOverlay.zip",
-  "notes": "Spaltenkoepfe der Aufnahme-Apps-Liste (can see/Program/Status/...) waren ebenfalls kaum lesbar - gleiche Ursache wie die Tab-Reiter. Dazu: die Status-Spalte war immer deutsch, auch im EN-Modus."
+  "notes": "Welt-Tags konnten waehrend eines kurzen Uebergangs noch durchs Inventory-HUD blitzen (Rest eines fruehreren Fixes). Updates werden ab jetzt automatisch heruntergeladen und eingespielt, kein Klick mehr noetig."
 }
