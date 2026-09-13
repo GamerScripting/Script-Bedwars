@@ -1,5 +1,5 @@
 {
-  "version": "1.0.1",
+  "version": "1.0.2",
   "url": "https://github.com/GamerScripting/Script-Bedwars/releases/latest/download/StreamproofOverlay.zip",
-  "notes": "Aufnahme-Apps-Liste: Haken blieben nicht immer sitzen, Zeilen teils schwer lesbar. Verbindungsaufbau robuster gegen einen kalten Start."
+  "notes": "Die drei Tab-Reiter neben dem gerade ausgewaehlten waren praktisch unsichtbar (helle Schrift auf hellem Systemhintergrund) - jetzt immer lesbar."
 }
