@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "url": "https://github.com/GamerScripting/Script-Bedwars/releases/latest/download/StreamproofOverlay.zip",
-  "notes": "Erste Fassung."
+  "notes": "Aufnahme-Apps-Liste: Haken blieben nicht immer sitzen, Zeilen teils schwer lesbar. Verbindungsaufbau robuster gegen einen kalten Start."
 }
