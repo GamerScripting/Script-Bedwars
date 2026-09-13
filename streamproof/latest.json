@@ -1,5 +1,5 @@
 {
-  "version": "1.0.4",
+  "version": "1.0.5",
   "url": "https://github.com/GamerScripting/Script-Bedwars/releases/latest/download/StreamproofOverlay.zip",
-  "notes": "Welt-Tags konnten waehrend eines kurzen Uebergangs noch durchs Inventory-HUD blitzen (Rest eines fruehreren Fixes). Updates werden ab jetzt automatisch heruntergeladen und eingespielt, kein Klick mehr noetig."
+  "notes": "Wichtig: die Aufnahme-Apps-Liste war in JEDER bisherigen Release-Fassung leer/unlesbar, nicht nur bei einzelnen Rechnern - eine Obfuscar-Einstellung hat die Datenbindung der Liste kaputtgemacht, jetzt behoben."
 }
