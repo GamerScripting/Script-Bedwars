@@ -1,5 +1,5 @@
 {
-  "version": "1.0.6",
+  "version": "1.0.7",
   "url": "https://github.com/GamerScripting/Script-Bedwars/releases/latest/download/StreamproofOverlay.zip",
-  "notes": "Wichtig: vollautomatische Updates (seit 1.0.4) wieder zurueckgenommen - konnte in einen Neustart-Kreislauf ohne Bremse laufen (App geht staendig auf und zu). Updates werden wieder nur GESUCHT, 'Update installieren' im Bedienfenster bleibt der Weg zum Einspielen."
+  "notes": "Panel schliesst jetzt zuverlaessig auch bei schnellem erneutem H; adaptive Leistungsanpassung fuer schwache Rechner; Panel laeuft fest auf 240 Hz; Update-Automatik ist zurueck, diesmal mit einer echten Bremse gegen den Neustart-Kreislauf von vorher (bei einer erneut fehlgeschlagenen Version wird nicht mehr automatisch nachgelegt, nur noch der Knopf im Bedienfenster geht dann)."
 }
