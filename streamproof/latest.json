@@ -1,5 +1,5 @@
 {
-  "version": "1.0.7",
+  "version": "1.0.8",
   "url": "https://github.com/GamerScripting/Script-Bedwars/releases/latest/download/StreamproofOverlay.zip",
-  "notes": "Panel schliesst jetzt zuverlaessig auch bei schnellem erneutem H; adaptive Leistungsanpassung fuer schwache Rechner; Panel laeuft fest auf 240 Hz; Update-Automatik ist zurueck, diesmal mit einer echten Bremse gegen den Neustart-Kreislauf von vorher (bei einer erneut fehlgeschlagenen Version wird nicht mehr automatisch nachgelegt, nur noch der Knopf im Bedienfenster geht dann)."
+  "notes": "Grosser Bildraten-Sprung im GPU-Renderpfad (vorher ~32 FPS, jetzt ~200-220 FPS gemessen); Overlay-Reste nach Verbindungsverlust/Skript-Unload behoben; Welt-Schilder blieben bei vielen gleichzeitig neuen Zielen (Kampfbeginn) haengen - behoben; starkes Panel-Scrollen liess Roblox eigene Bildrate stark einbrechen - deutlich reduziert; Leistungsstufe Normal belastete Roblox eigene Bildrate auch im Leerlauf - behoben."
 }
