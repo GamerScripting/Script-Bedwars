@@ -76,7 +76,7 @@ end
 --------------------------------------------------------------------
 -- Konfiguration
 --------------------------------------------------------------------
-SP.VERSION  = "1.0.0"
+SP.VERSION  = "2.0"
 SP.PORT     = 7373
 SP.BASE     = "http://127.0.0.1:7373"
 SP.WSURL    = "ws://127.0.0.1:7373/ws"
@@ -96,6 +96,7 @@ SP.SCREENGUIS = { "KitPanel_MCP", "KitInvHud_MCP" }
 --    on         laeuft, Frames gehen raus
 --    lost       Verbindung waehrend des Betriebs verloren
 SP.active   = false
+SP.auto     = false   -- Auto-Regler der Raten, siehe SP.setAuto
 SP.status   = "off"
 SP.note     = ""
 SP.fps      = 0
@@ -198,9 +199,70 @@ SP.rate = {
 }
 
 --  Von aussen setzbar, damit die App die Werte fernsteuern kann.
-function SP.setRate(tagsHz, panelHz)
-	if tonumber(tagsHz)  then SP.rate.tags  = math.clamp(tonumber(tagsHz), 0, 240) end
-	if tonumber(panelHz) then SP.rate.panel = math.clamp(tonumber(panelHz), 1, 240) end
+--
+--  Drei Dinge, die hier zu beachten sind (jedes davon war ein echter Fehler
+--  oder haette einer werden koennen):
+--    * tagsHz >= 240 heisst "jedes Bild" (= 0). 240 als feste Taktzeit
+--      (4,17 ms) wuerde bei 240 Bildern je Sekunde durch das kleinste Zittern
+--      der Bilddauer zufaellig jedes zweite Bild auslassen.
+--    * minPanel darf NIE ueber panel liegen: der Regler in startLoop
+--      rechnet math.clamp(erlaubt, minPanel, panel), und das wirft in Luau
+--      einen Fehler, wenn min > max ist - "normal" setzt minPanel = 240,
+--      also wuerde jedes panelHz unter 240 die Sende-Schleife abschiessen.
+--      Bei einem festen Wert gilt danach panel = minPanel = Wert, dasselbe
+--      "kein kostenbasierter Deckel" wie im Profil "normal".
+--    * auto (true/false) schaltet den Regler unten (siehe AUTO) ein oder aus.
+function SP.setRate(tagsHz, panelHz, auto)
+	if tonumber(tagsHz) then
+		local t = math.clamp(tonumber(tagsHz), 0, 240)
+		if t >= 240 then t = 0 end
+		if t > 0 then t = math.max(t, 20) end
+		SP.rate.tags = t
+	end
+	if tonumber(panelHz) then
+		SP.rate.panel = math.clamp(tonumber(panelHz), 1, 240)
+		--  Vom Profil aus rechnen (minPanelBase), nicht vom letzten Wert: sonst
+		--  bliebe minPanel nach "erst 100, dann wieder 240" auf 100 haengen.
+		SP.rate.minPanelBase = SP.rate.minPanelBase or SP.rate.minPanel
+		SP.rate.minPanel = math.min(SP.rate.minPanelBase, SP.rate.panel)
+	end
+	if auto ~= nil then SP.setAuto(auto) end
+end
+
+--  AUTO: SO VIEL SENDEN WIE MOEGLICH, OHNE DASS DIE BRUECKE MERKLICH
+--  FRAMES KOSTET.
+--
+--  Die Bruecke laeuft auf dem Render-Thread von Roblox; ihre Kosten sind
+--  direkt Bildrate. Sie misst sich deshalb selbst (Zeit je Schild-Durchlauf
+--  plus Senden, gleitender Mittelwert) und waehlt daraus die hoechste
+--  Schild-Rate, bei der sie hoechstens AUTO_BUDGET einer Sekunde braucht:
+--
+--      last = min(Rate, aktuelle_fps) * (ms je Durchlauf)      [ms je Sekunde]
+--
+--  0,08 = 80 ms je Sekunde = 8 % des Render-Threads. Auf einem schnellen
+--  Rechner ist das jedes Bild (Auto tut dann nichts), auf einem schwachen
+--  faellt die Rate stufenweise, bis es passt - und steigt von selbst wieder,
+--  wenn Luft ist. Abwaerts geht es schnell (1 s), aufwaerts langsam (3 s) und
+--  nur eine Stufe je Schritt, damit es nicht pendelt.
+--
+--  Das Panel laeuft im Auto-Modus ueber den vorhandenen kostenbasierten Regler
+--  (minPanel 30 statt der festen 240 des Profils "normal"): bei Bedienung
+--  wird es hoechstens so oft gelesen, wie maxLoadBusy erlaubt.
+local AUTO_BUDGET = 0.08
+local AUTO_LADDER = { 0, 180, 120, 90, 60, 45, 30 }   -- 0 = jedes Bild
+local AUTO = { on = false, cur = 1, want = 1, votes = 0, tagEma = nil, sendEma = nil }
+SP.autoInfo = AUTO
+
+function SP.setAuto(on)
+	on = on and true or false
+	if on == SP.auto then return end
+	SP.auto = on
+	AUTO.on, AUTO.cur, AUTO.want, AUTO.votes = on, 1, 1, 0
+	if on then
+		SP.rate.tags     = AUTO_LADDER[1]
+		SP.rate.panel    = 240
+		SP.rate.minPanel = 30
+	end
 end
 
 --  Die Leistungsstufen, die das Programm hier herueberschickt.
@@ -213,6 +275,10 @@ end
 --  verliert. Darum drei Stufen statt einer Vermutung.
 function SP.setProfile(name)
 	local r = SP.rate
+	--  Das Profil ist die Grundlage: es ueberschreibt alle Raten unten, also
+	--  endet damit auch Auto. Wer Auto will, schickt danach "rate" mit auto=true
+	--  (die App tut das in dieser Reihenfolge).
+	SP.auto, AUTO.on = false, false
 	if name == "spar" then
 		r.tags, r.panel, r.panelIdle       = 60,  40,  4
 		r.maxLoadBusy, r.maxLoadIdle       = 0.03, 0.005
@@ -248,10 +314,52 @@ function SP.setProfile(name)
 		--  unnoetig frueh getroffen hat. Welt-Tags (r.tags) stehen bereits
 		--  auf 0 - "jeder gerenderte Frame", also schon schneller als jede
 		--  feste Zahl es waere; fuer sie gibt es hier nichts anzuheben.
-		r.tags, r.panel, r.panelIdle       = 0,   180, 10
+		--  panel/minPanel FEST AUF 240, AUF AUSDRUECKLICHEN WUNSCH - kein
+		--  kostenbasierter Deckel mehr FUER DEN FALL, DASS SICH WIRKLICH
+		--  ETWAS AENDERT. Die adaptive Fassung (kostenbasierter Regler ohne
+		--  Boden) wurde live erprobt und wieder verworfen: der Regler kann
+		--  "erlaubt" bei einem teuren Panel weit unter das Ziel druecken
+		--  (live beobachtet: ~90 Hz statt der eingestellten 240) statt die
+		--  vollen 240 wirklich auszunutzen. minPanel = panel = 240 heisst:
+		--  math.clamp(erlaubt, minPanel, panel) kann nur noch genau 240
+		--  liefern, egal was die Kostenrechnung sagt.
+		--
+		--  panelIdle DAGEGEN NICHT AUF 240 - das war ein eigener, echter
+		--  Fehler, gefunden nachdem "es kostet doch kaum was, nimmt aber
+		--  Roblox trotzdem die ganze Bildrate" gemeldet wurde. panelIdle ist
+		--  laut startLoop (siehe "due" dort) NICHT die Drosselung bei
+		--  Ruhe - dafuer sorgt schon panelPulse()/changed/SP.dirty ganz von
+		--  selbst, unabhaengig von panelIdle. panelIdle ist die NOTBREMSE
+		--  daneben: "und wenn keine dieser Erkennungen etwas gesehen hat,
+		--  trotzdem spaetestens alle 1/panelIdle Sekunden nachsehen" - ein
+		--  Sicherheitsnetz gegen eine Aenderung, die keine der Erkennungen
+		--  greift. Stand hier 240, feuert dieses Sicherheitsnetz PRAKTISCH
+		--  JEDEN DURCHLAUF von selbst (1/240 ist fast immer schon um), und
+		--  serializeScreen() - der teure volle Baum-Durchlauf, mehrere
+		--  Millisekunden bei einem grossen Panel - lief dadurch effektiv
+		--  bei JEDEM Bild, VOELLIG UNABHAENGIG davon, ob sich am Panel
+		--  wirklich etwas geaendert hatte. Genau das war die "nimmt die
+		--  ganze Bildrate"-Beobachtung: nicht die Rate selbst war das
+		--  Problem, sondern dass die "nur bei echter Aenderung"-Bremse
+		--  durch panelIdle=240 dauerhaft ausser Kraft war. Mit panelIdle
+		--  wieder niedrig bleibt die Reaktion auf ECHTE Aenderungen weiter
+		--  sofort und ungedrosselt bei 240 (siehe changed/SP.dirty oben in
+		--  "due") - nur das planlose Nachsehen "nur fuer den Fall" faellt
+		--  wieder auf einen guenstigen Takt zurueck, wo es hingehoert.
+		--
+		--  "sofern offen": steht das Panel zu, greift ohnehin
+		--  serializeScreen()/panelOffen() und es wird gar nicht erst
+		--  gelesen, siehe dort - all das hier gilt nur, waehrend wirklich
+		--  etwas zu lesen ist.
+		--
+		--  Welt-Tags (r.tags) stehen bereits auf 0 - "jeder gerenderte
+		--  Frame", also schon schneller als jede feste Zahl es waere; fuer
+		--  sie gibt es hier nichts anzuheben, sie sind bereits unbegrenzt.
+		r.tags, r.panel, r.panelIdle       = 0,   240, 10
 		r.maxLoadBusy, r.maxLoadIdle       = 0.12, 0.01
-		r.busyFor, r.minPanel              = 0.4, 10
+		r.busyFor, r.minPanel              = 0.4, 240
 	end
+	r.minPanelBase = r.minPanel   -- Grundlage fuer SP.setRate, siehe dort
 	SP.profile = name or "normal"
 	return SP.profile
 end
@@ -267,6 +375,14 @@ function SP.touch()
 	--  mehr gibt.
 	SP.dropScrollCache = true
 	SP.dropDeco = true
+end
+
+--  Leiser Hinweis vom Hauptskript: "am Panel/HUD hat sich gerade etwas
+--  geaendert". Loest im naechsten Bild EINEN Durchlauf aus - ohne das
+--  Nachhalten (settling) und den Neuaufbau-Zwischenspeicher, die SP.touch()
+--  mitbringt, weil hier nichts neu gebaut wurde, nur Inhalt getauscht.
+function SP.poke()
+	SP.poked = true
 end
 
 --  Registry aller BillboardGuis, die das Hauptskript erzeugt hat. Gefuellt
@@ -353,6 +469,52 @@ end
 
 local HALTE = 0.6
 local held = {}
+
+--  INHALT JE SCHILD NUR ALLE PAAR ZEHNTELSEKUNDEN NEU LESEN, POSITION JEDES BILD.
+--
+--  Das ist die Stelle, an der die Bruecke ihre Zeit auf dem Render-Thread von
+--  Roblox verbraucht (gemessen, 12 Schilder, 7 sichtbar: emit 0,315 ms von
+--  0,424 ms je Bild - drei Viertel). emit() liest den GANZEN Baum eines
+--  Schildes (Rahmen, Zeilen, Texte, Bilder - dutzende Elemente mit je einem
+--  Dutzend Eigenschaften) und baut daraus JSON, und das fuer jedes sichtbare
+--  Schild in JEDEM Bild - obwohl sich der Inhalt eines Schildes (Name,
+--  Distanz, HP, Kit, Ruestung) nur ein paar Mal je Sekunde aendert. Was sich
+--  jedes Bild aendert, ist einzig die BILDSCHIRMSTELLE - und die steht im
+--  Gruppenkopf und wird weiter jedes Bild frisch berechnet.
+--
+--  Der Inhalt eines Schildes ist relativ zur Schild-Box gemessen (siehe die
+--  Begruendung beim Gruppenkopf in serializeTags), haengt also nicht von der
+--  Kamera ab. Er haengt ab von: der Groesse der Box (bw/bh - aendert sich sie,
+--  wird sofort neu gelesen), dem Verblassen (fq, in Stufen, siehe unten) und
+--  der Zeit (TAG_TTL - Text, Farben, Balken).
+--
+--  Je Schild ein Eintrag: s = die fertig zusammengesetzten Befehle der Kinder
+--  als EIN Text (oder false, wenn das Schild nichts zeichnet), n = wieviele
+--  Befehle das sind, dazu der Schluessel (bw, bh, fq) und exp (bis wann er
+--  gilt). exp ist je Schild um bis zu 12 ms versetzt: wuerden alle Schilder im
+--  selben Bild ablaufen, kaeme die Last als Spitze statt verteilt - und genau
+--  die Spitzen sind es, die als Ruckler ankommen (1%-Lows).
+--
+--  Aufgeraeumt wie held/tagIds: mit dem Schild (enforceTags) und beim
+--  Abschalten. KEINE schwache Tabelle - aus demselben Grund wie SP.tags.
+local TAGC = {}
+local FADE_STEPS = 32
+
+--  WIE LANGE EIN INHALT GILT, HAENGT AN DER BILDRATE.
+--
+--  Fuenf Bilder, aber nie kuerzer als 1/30 s und nie laenger als 1/12 s. Bei
+--  240 Bildern sind das die 33 ms unten (alle ~8 Bilder einmal lesen), bei
+--  100 Bildern 50 ms, bei 30 Bildern die Obergrenze von 83 ms. Der Grund: die
+--  KOSTEN je Lesen sind fest, der GEWINN aber ist der Anteil der Bilder, die
+--  ohne Lesen davonkommen - bei einer festen Zeit hiesse das, dass ein
+--  schwacher Rechner mit wenigen Bildern je Sekunde viel WENIGER spart als ein
+--  schneller, genau der, der es am noetigsten hat. Fuer ein Namensschild
+--  (Text, Distanz, HP) sind 50-80 ms nicht zu sehen.
+--
+--  frameDt: gleitender Mittelwert der Bilddauer, in der Hauptschleife
+--  nachgefuehrt.
+local TAG_TTL_MIN, TAG_TTL_MAX, TAG_TTL_FRAMES = 1 / 30, 1 / 12, 5
+local frameDt = 1 / 60
 
 
 function SP.note_tag(inst)
@@ -522,13 +684,29 @@ local function showScreenGui(gui)
 	grp:Destroy()
 end
 
+--  RUECKWAERTS DURCH SP.SCREENGUIS - NUR HIER ZAEHLT DIE REIHENFOLGE.
+--
+--  SP.SCREENGUIS = { "KitPanel_MCP", "KitInvHud_MCP" } - Index 1 ist
+--  anderswo (siehe serializeTags(), panelRef) ausdruecklich "das
+--  Haupt-Panel", unabhaengig von jeder Zeichenreihenfolge. Fuer diese
+--  Funktion hier bedeutet dieselbe Reihenfolge aber gleichzeitig
+--  "zuerst emittiert" - und auf der C#-Seite (FrameCanvas/D2DContent,
+--  eine einzige sequentielle Schleife je Kachel, kein eigenes Fenster
+--  je Element wie bei Welt-Schildern) heisst zuerst emittiert schlicht
+--  zuerst gezeichnet, also HINTEN. Unveraendert waere das Panel (Index 1,
+--  soll laut Anforderung ganz vorne stehen) HINTER dem Inventar-HUD
+--  (Index 2) gelandet, sobald beide sich einmal ueberlappen - die exakt
+--  falsche Reihenfolge. Rueckwaerts durchlaufen dreht nur die
+--  ZEICHENREIHENFOLGE um (Index 1 zuletzt = vorne), ohne SP.SCREENGUIS
+--  selbst oder seinen Index-1-heisst-Hauptpanel-Sinn woanders
+--  anzufassen.
 local function eachScreenGui(fn)
 	local hui = nil
 	pcall(function() hui = gethui() end)
 	for _, root in ipairs({ hui, game:GetService("CoreGui") }) do
 		if root then
-			for _, name in ipairs(SP.SCREENGUIS) do
-				local gui = root:FindFirstChild(name)
+			for i = #SP.SCREENGUIS, 1, -1 do
+				local gui = root:FindFirstChild(SP.SCREENGUIS[i])
 				if gui and gui:IsA("ScreenGui") then fn(gui) end
 			end
 		end
@@ -677,6 +855,7 @@ local function enforceTags(on)
 			SP.want[gui] = nil
 			held[gui] = nil
 			tagIds[gui] = nil
+			TAGC[gui] = nil
 		elseif on then
 			SP.hideTag(gui)
 		end
@@ -710,11 +889,54 @@ end
 local buf, bn, busy = {}, 0, false
 local function put(s) bn += 1; buf[bn] = s end
 
+--  SCHEIBCHENWEISES LESEN DES PANELS (siehe sliceStep unten). emit() schaut bei
+--  eingeschaltetem SLICE_ON alle paar Elemente auf die Uhr und gibt die Kontrolle
+--  ab, wenn das Zeitbudget dieses Bildes aufgebraucht ist.
+local SLICE_ON, SLICE_N, SLICE_DEADLINE = false, 0, 0
+
+--  PHASEN-PROFIL (SP.messen, ganz unten) - NUR ZEITMESSUNG.
+--  (NICHT SP.profile: das ist schon der Name der Leistungsstufe, siehe
+--  SP.setProfile - eine Funktion gleichen Namens wurde beim Aktivieren
+--  stumm mit "normal" ueberschrieben.)
+--
+--  Die Frage "warum nur 230 statt 240 fps" liess sich mit den beiden
+--  Gesamtzahlen (SP.tagMs, SP.panelMs) nicht beantworten: welcher TEIL
+--  der Arbeit kostet, war reine Vermutung. PROF.on ist im Normalbetrieb
+--  false - dann kostet jede Messstelle genau einen Feldzugriff und einen
+--  Vergleich. Erst SP.messen(sekunden) schaltet die Uhren ein.
+local PROF = { on = false, t = {}, frames = 0 }
+local function profAdd(name, v)
+	local p = PROF.t[name]
+	if not p then p = { n = 0, sum = 0, max = 0, s = {} }; PROF.t[name] = p end
+	p.n += 1
+	p.sum += v
+	if v > p.max then p.max = v end
+	--  Nur die ersten 4000 Werte fuer das Perzentil - begrenzt den Speicher.
+	if p.n <= 4000 then p.s[p.n] = v end
+end
+local function profMark(t0, name)
+	local t1 = os.clock()
+	profAdd(name, (t1 - t0) * 1000)
+	return t1
+end
+
+--  Gemerkt wie weightOf oben: eine Oberflaeche benutzt praktisch immer
+--  dieselbe Handvoll THEME-Farben auf hunderten Elementen - bei jedem
+--  Bild dieselben paar Byte-Tripel erneut zu formatieren war reine
+--  Wiederholung. Farbe selbst als Schluessel (Color3 vergleicht in Luau
+--  nach Wert, nicht nach Identitaet), keine Obergrenze noetig: anders als
+--  deco/SP.tags oben haengt das nicht an einzelnen Instanzen, die kommen
+--  und gehen - der Farbraum einer Oberflaeche bleibt klein und fest.
+local HEX = {}
 local function hex(c)
-	return ("%02X%02X%02X"):format(
+	local h = HEX[c]
+	if h then return h end
+	h = ("%02X%02X%02X"):format(
 		math.floor(c.R * 255 + 0.5),
 		math.floor(c.G * 255 + 0.5),
 		math.floor(c.B * 255 + 0.5))
+	HEX[c] = h
+	return h
 end
 
 --  JSON-Textliteral. gsub mit einer Tabelle statt fuenf Einzelaufrufen -
@@ -779,6 +1001,53 @@ local SCALE_M = {
 	[Enum.ScaleType.Tile] = 0,
 }
 local TRUNC_END = Enum.TextTruncate.AtEnd
+
+--  KLASSENNAME EINMAL LESEN STATT NEUN MAL IsA() FRAGEN.
+--
+--  Jeder IsA() ist ein Aufruf in die Engine - emit() stellte davon je Element
+--  bis zu neun (GuiObject, ImageLabel, ImageButton, dreimal Text, doppelt in
+--  den beiden Text-Zweigen, ViewportFrame, ScrollingFrame), und emit() laeuft
+--  fuer jedes Element jedes Schildes in jedem Bild. Das ist der Hauptposten
+--  der Bruecke auf dem Render-Thread von Roblox (gemessen: rund 84 % der
+--  Tag-Zeit), und auf einem schwachen Rechner kostet jeder dieser Aufrufe ein
+--  Mehrfaches.
+--
+--  ClassName ist EIN Lesezugriff, und die Klassen unten haben keine
+--  Unterklassen - IsA("TextLabel") ist also genau ClassName == "TextLabel".
+--  Nur GuiObject selbst ist eine Oberklasse; dafuer wird je Klassenname EINMAL
+--  IsA gefragt und das Ergebnis gemerkt (unbekannte Klassen, etwa kuenftige
+--  Roblox-Neuzugaenge, werden so trotzdem richtig eingeordnet).
+local IS_GUIOBJ = {
+	Frame = true, ScrollingFrame = true, CanvasGroup = true,
+	TextLabel = true, TextButton = true, TextBox = true,
+	ImageLabel = true, ImageButton = true, ViewportFrame = true,
+	VideoFrame = true,
+	--  Haeufige NICHT-GuiObject-Kinder eines GUI-Elements, damit auch sie nie
+	--  einen IsA-Aufruf brauchen.
+	UICorner = false, UIStroke = false, UIPadding = false, UIListLayout = false,
+	UIGridLayout = false, UIAspectRatioConstraint = false, UIGradient = false,
+	UIScale = false, UISizeConstraint = false, UITextSizeConstraint = false,
+	UIPageLayout = false, UITableLayout = false, UIFlexItem = false,
+	LocalScript = false, Script = false, ModuleScript = false,
+	StringValue = false, NumberValue = false, BoolValue = false,
+	ObjectValue = false, IntValue = false, Folder = false,
+}
+local IS_TEXT  = { TextLabel = true, TextButton = true, TextBox = true }
+local IS_IMAGE = { ImageLabel = true, ImageButton = true }
+--  Arbeitsfeld fuer die ZIndex-Werte der Geschwister (siehe emit). Ein
+--  gemeinsames genuegt: es wird gefuellt, sortiert und ist fertig, BEVOR emit
+--  in die Kinder abtaucht - nie zwei Ebenen gleichzeitig.
+local ZSCRATCH = {}
+
+--  "Ist das ein GuiObject?" - ohne IsA fuer alles, was schon bekannt ist.
+local function isGuiObject(inst, cls)
+	local g = IS_GUIOBJ[cls]
+	if g == nil then
+		g = inst:IsA("GuiObject")
+		IS_GUIOBJ[cls] = g
+	end
+	return g
+end
 
 --  Ecke, Rahmen und Polster eines Elements - EINMAL nachgesehen, dann
 --  gemerkt.
@@ -856,8 +1125,23 @@ end
 --  wie stark dieses (Welt-Tag-)Schild gerade verdeckt ist, 0 fuer alles
 --  ausserhalb der Welt-Tags (Panel kennt keine Ueberdeckung durch andere
 --  Panel-Elemente in diesem Sinne).
-local function emit(inst, ox, oy, fade)
-	if not inst:IsA("GuiObject") or not inst.Visible then return end
+--  known: der Aufrufer (die Kinderschleife weiter unten) hat GuiObject und
+--  Visible dieses Elements schon geprueft - beides ein zweites Mal zu lesen
+--  waeren zwei Aufrufe in die Engine je Element und Bild fuer dieselbe Antwort.
+local function emit(inst, ox, oy, fade, known)
+	--  Nur waehrend eines Scheibchens (sliceStep) an: alle paar Elemente auf die
+	--  Uhr sehen und abgeben, wenn das Budget dieses Bildes verbraucht ist. Sonst
+	--  kostet das hier einen Vergleich.
+	if SLICE_ON then
+		SLICE_N += 1
+		if SLICE_N >= 6 then
+			SLICE_N = 0
+			if os.clock() >= SLICE_DEADLINE then coroutine.yield() end
+		end
+	end
+	local cls = inst.ClassName
+	if not known and (not isGuiObject(inst, cls) or not inst.Visible) then return end
+	local isText = IS_TEXT[cls]
 
 	local ap, as = inst.AbsolutePosition, inst.AbsoluteSize
 	local x, y, w, h = ap.X + ox, ap.Y + oy, as.X, as.Y
@@ -890,8 +1174,7 @@ local function emit(inst, ox, oy, fade)
 				:format(hex(s.Color), num(s.Thickness), num(fadeT(s.Transparency, fade)))
 		end
 		put(t .. "}")
-	elseif w > 0 and h > 0
-		and not (inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox")) then
+	elseif w > 0 and h > 0 and not isText then
 		--  Rahmen ohne Fuellung gibt es auch (Chips mit transparentem Grund).
 		--  NICHT fuer Text: ein UIStroke im Contextual-Modus auf einem
 		--  TextLabel (genESP/dropESP, siehe deren stroke()-Aufrufe) soll die
@@ -908,8 +1191,17 @@ local function emit(inst, ox, oy, fade)
 	end
 
 	--  Bild
-	if (inst:IsA("ImageLabel") or inst:IsA("ImageButton"))
-		and inst.Image ~= "" and inst.ImageTransparency < 1 then
+	--
+	--  w>0/h>0 wie beim Rechteck (oben) und beim ViewportFrame-Platzhalter
+	--  (unten) - nur hier fehlte die Pruefung. Eine kollabierte Box (siehe
+	--  die "KOLLABIERTE BOX"-Begruendung weiter unten in dieser Datei: ein
+	--  Schild, waehrend die Bruecke laeuft angelegt, hat sein erstes
+	--  Roblox-Layout nie gesehen) liefert hier w=0 und/oder h=0 - ohne
+	--  diese Pruefung wurde trotzdem ein "k":"i"-Befehl mit einer nullgrossen
+	--  Flaeche verschickt, gemeldet als ein fehlendes/falsches Icon genau in
+	--  diesem einen Fall.
+	if IS_IMAGE[cls]
+		and inst.Image ~= "" and inst.ImageTransparency < 1 and w > 0 and h > 0 then
 		put(('{"k":"i","x":%s,"y":%s,"w":%s,"h":%s,"u":%s,"a":%s,"r":%s,"sm":%d,"c":"%s"}')
 			:format(num(x), num(y), num(w), num(h), jstr(inst.Image),
 				num(fadeT(inst.ImageTransparency, fade)), num(rad),
@@ -918,9 +1210,9 @@ local function emit(inst, ox, oy, fade)
 	end
 
 	--  Text
-	if (inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox")) then
+	if isText then
 		local txt = inst.Text
-		if inst:IsA("TextBox") and txt == "" then
+		if cls == "TextBox" and txt == "" then
 			txt = inst.PlaceholderText
 		end
 		if txt ~= "" and inst.TextTransparency < 1 then
@@ -960,40 +1252,70 @@ local function emit(inst, ox, oy, fade)
 	--  3D-Modell, und das rendert Roblox selbst. Statt es zu faelschen
 	--  bekommt die Stelle einen Platzhalter; betroffen ist allein das
 	--  Mech-Renderbild der Stufe 1, alles andere sind echte 2D-Bilder.
-	if inst:IsA("ViewportFrame") and w > 0 and h > 0 then
+	if cls == "ViewportFrame" and w > 0 and h > 0 then
 		put(('{"k":"r","x":%s,"y":%s,"w":%s,"h":%s,"c":"3C4252","a":%s,"r":%s}')
 			:format(num(x), num(y), num(w), num(h), num(fadeT(0.35, fade)), num(rad)))
 	end
 
 	--  Kinder. ZIndexBehavior ist im Hauptskript "Sibling": Geschwister
 	--  werden nach ZIndex sortiert, der Baum bleibt sonst die Reihenfolge.
-	local kids = {}
-	for _, ch in ipairs(inst:GetChildren()) do
-		if ch:IsA("GuiObject") and ch.Visible then kids[#kids + 1] = ch end
+	--
+	--  Die Kinder-Tabelle entsteht erst beim ERSTEN sichtbaren GUI-Kind: die
+	--  meisten Elemente sind Blaetter, und fuer die wurde bisher in jedem Bild
+	--  eine leere Tabelle angelegt und weggeworfen.
+	local kids, nk = nil, 0
+	local list = inst:GetChildren()
+	for i = 1, #list do
+		local ch = list[i]
+		if isGuiObject(ch, ch.ClassName) and ch.Visible then
+			nk += 1
+			if not kids then kids = {} end
+			kids[nk] = ch
+		end
 	end
-	if #kids == 0 then return end
-	if #kids > 1 then
+	if nk == 0 then return end
+	if nk > 1 then
 		--  Stabil sortieren: bei gleichem ZIndex bleibt die Baumreihenfolge,
 		--  sonst springen gleichrangige Elemente von Frame zu Frame.
-		local idx = {}
-		for i, ch in ipairs(kids) do idx[ch] = i end
-		table.sort(kids, function(a, b)
-			if a.ZIndex ~= b.ZIndex then return a.ZIndex < b.ZIndex end
-			return idx[a] < idx[b]
-		end)
+		--
+		--  ZIndex wird je Kind EINMAL gelesen (der Vergleich in table.sort las
+		--  ihn bei jedem Vergleich neu, zweimal), und sortiert wird nur, wenn
+		--  die Reihenfolge nicht ohnehin schon stimmt - meistens haben alle
+		--  Geschwister denselben ZIndex. Die Einfuegesortierung ist stabil und
+		--  liefert damit dieselbe Reihenfolge wie vorher; sie braucht weder
+		--  eine Hilfstabelle noch eine Vergleichsfunktion je Aufruf.
+		local zs = ZSCRATCH
+		local geordnet, prevZ = true, -math.huge
+		for i = 1, nk do
+			local z = kids[i].ZIndex
+			zs[i] = z
+			if z < prevZ then geordnet = false end
+			prevZ = z
+		end
+		if not geordnet then
+			for i = 2, nk do
+				local ch, z = kids[i], zs[i]
+				local j = i - 1
+				while j >= 1 and zs[j] > z do
+					kids[j + 1], zs[j + 1] = kids[j], zs[j]
+					j -= 1
+				end
+				kids[j + 1], zs[j + 1] = ch, z
+			end
+		end
 	end
 
 	local clip = inst.ClipsDescendants and w > 0 and h > 0
 	if clip then
 		put(('{"k":"c","x":%s,"y":%s,"w":%s,"h":%s}'):format(num(x), num(y), num(w), num(h)))
 	end
-	for _, ch in ipairs(kids) do emit(ch, ox, oy, fade) end
+	for i = 1, nk do emit(kids[i], ox, oy, fade, true) end
 	if clip then put('{"k":"e"}') end
 
 	--  Scrollbalken. Roblox zeichnet ihn selbst und er taucht im Baum nicht
 	--  auf - ohne ihn saehe eine lange Liste im Overlay so aus, als gaebe
 	--  es nichts mehr zu scrollen.
-	if inst:IsA("ScrollingFrame") and inst.ScrollBarThickness > 0 then
+	if cls == "ScrollingFrame" and inst.ScrollBarThickness > 0 then
 		local cs, ws = inst.AbsoluteCanvasSize, inst.AbsoluteWindowSize
 		local th = inst.ScrollBarThickness
 		if cs.Y > ws.Y + 1 and ws.Y > 0 then
@@ -1020,21 +1342,84 @@ end
 --  Overlay-Fenster deckt aber die ganze Client-Flaeche ab. An diesem Build
 --  gemessen sind das 58 Pixel - der Wert wird trotzdem jeden Frame
 --  gelesen, weil er sich mit ein-/ausgeblendeter Topbar aendert.
+--
+--  GILT AUCH FUER IgnoreGuiInset=true - NICHT WIEDER WEGLASSEN.
+--
+--  KitPanel_MCP und KitInvHud_MCP haben IgnoreGuiInset=true, und trotzdem
+--  liegt AbsolutePosition weiter im Inset-Raum. Live gemessen
+--  (2026-09-19): die ScreenGui selbst hat AbsolutePosition = (0, -58),
+--  der HUD-Container y = -3 - die echte Bildschirmstelle ist also
+--  AbsolutePosition + Inset. Ein Versuch, den Inset wegzulassen (aus einem
+--  Kommentar ueber die MAUS geschlossen, GetMouseLocation ist ein anderer
+--  Raum), schob Panel und HUD im Overlay um 58 px nach oben - gegenueber
+--  den unsichtbaren echten Klickflaechen darunter. Folge: Klicken und
+--  Ziehen gingen ins Leere. Diese Zeile war von Anfang an richtig.
+--  Der eigentliche Durchlauf, ohne Waechter und ohne eigenen Puffer: er schreibt
+--  in den gerade eingehaengten (buf, bn). So kann derselbe Code am Stueck
+--  (serializeScreen) oder scheibchenweise (sliceStep, in einer Coroutine)
+--  laufen.
+local function screenCore()
+	if SP.dropDeco then SP.dropDeco = false; decoClear() end
+	local inset = GuiService:GetGuiInset()
+	local ix, iy = inset.X, inset.Y
+	eachScreenGui(function(gui)
+		if not gui.Enabled then return end
+		local grp = groupOf(gui, false)
+		--  emit prueft GuiObject und Visible selbst - ein Vorab-IsA je
+		--  Kind hier war dieselbe Frage zweimal.
+		for _, ch in ipairs((grp or gui):GetChildren()) do
+			emit(ch, ix, iy)
+		end
+	end)
+end
+
+--  DAS PANEL IM LEERLAUF SCHEIBCHENWEISE LESEN.
+--
+--  Ein voller Durchlauf ueber Panel und Inventar-HUD kostet auf diesem
+--  (schnellen) Rechner 4 ms in EINEM Bild - auf einem schwachen ein Vielfaches,
+--  und das ist genau ein Ruckler: das Bild, in dem er laeuft, dauert doppelt
+--  bis dreifach so lang (die "Lows"). Die Gesamtarbeit bleibt gleich, aber
+--  auf viele Bilder verteilt (je hoechstens budgetSec) ist jedes einzelne
+--  kaum zu spueren.
+--
+--  NUR fuer den Leerlauf-Durchlauf. Alles, was schnell gehen muss (Maus ueber
+--  dem Panel, Ziehen, Neuaufbau, der Hinweis SP.poke) laeuft weiter am Stueck.
+--  Aendert sich das Panel MITTEN im Scheibchen, ist dieser eine Durchlauf ein
+--  Mischstand - der naechste (dann mit vollem Takt, siehe idleGap) stellt es
+--  richtig, und ein erzwungener Durchlauf verwirft das laufende Scheibchen
+--  ohnehin sofort.
+--
+--  Eigener Puffer je Scheibchen: die Tags nutzen zwischen zwei Bildern den
+--  gemeinsamen (buf, bn) und wuerden ihn sonst zerschiessen.
+local function sliceBegin()
+	return { co = coroutine.create(screenCore), buf = {}, bn = 0, ms = 0 }
+end
+
+local function sliceStep(sl, budgetSec)
+	local tb, tn = buf, bn
+	buf, bn = sl.buf, sl.bn
+	local t0 = os.clock()
+	SLICE_ON, SLICE_N, SLICE_DEADLINE = true, 0, t0 + budgetSec
+	local ok, err = coroutine.resume(sl.co)
+	SLICE_ON = false
+	sl.buf, sl.bn = buf, bn
+	buf, bn = tb, tn
+	sl.ms += (os.clock() - t0) * 1000
+	if not ok then
+		SP.lastError = tostring(err)
+		return "error"
+	end
+	if coroutine.status(sl.co) == "dead" then
+		return "done", "[" .. table.concat(sl.buf, ",", 1, sl.bn) .. "]", sl.bn
+	end
+	return "more"
+end
+
 local function serializeScreen()
 	if busy then return "[]", 0 end
-	if SP.dropDeco then SP.dropDeco = false; decoClear() end
 	busy = true
 	buf, bn = {}, 0
-	local inset = GuiService:GetGuiInset()
-	local ok, err = pcall(function()
-		eachScreenGui(function(gui)
-			if not gui.Enabled then return end
-			local grp = groupOf(gui, false)
-			for _, ch in ipairs((grp or gui):GetChildren()) do
-				if ch:IsA("GuiObject") then emit(ch, inset.X, inset.Y) end
-			end
-		end)
-	end)
+	local ok, err = pcall(screenCore)
 	busy = false
 	if not ok then
 		--  Ein einzelnes kaputtes Element darf nicht die ganze Bruecke
@@ -1153,7 +1538,19 @@ SP.tagMinHeadGap = 20
 local function project(cf, fovDeg, vpx, vpy, world)
 	local rel = cf:PointToObjectSpace(world)
 	local depth = -rel.Z
-	if depth <= 0 then return nil end
+	--  NICHT NUR "HINTER DER KAMERA" (<= 0) - AUCH "PRAKTISCH DARIN".
+	--
+	--  nx/ny unten teilen durch depth. Bei einem Wert nahe null bleibt der
+	--  Nenner zwar noch positiv (besteht also die alte Pruefung), aber der
+	--  Quotient kann trotzdem ins Riesenhafte wachsen - bis hin zu einem
+	--  Wert, der beim Runden auf float (die Leitung nach C#, siehe
+	--  Protocol.cs) zu Infinity ueberlaeuft. Ein einziges so entstandenes
+	--  Bild-Feld (x/y/w/h/...) reicht aus, um eine abgeleitete Direct2D-
+	--  Geometrie mit einem nicht-endlichen Parameter zu fuettern. 0.05 Studs
+	--  ist near genug an der Kamera, dass ein Schild dort ohnehin nichts
+	--  Sinnvolles mehr waere - dieselbe Kategorie wie "hinter der Kamera",
+	--  nur etwas grosszuegiger gefasst.
+	if depth <= 0.05 then return nil end
 	local tanHalf = math.tan(math.rad(fovDeg) * 0.5)
 	local nx = (rel.X / (depth * tanHalf * (vpx / vpy))) * 0.5 + 0.5
 	local ny = 0.5 - (rel.Y / (depth * tanHalf)) * 0.5
@@ -1288,6 +1685,37 @@ local panelRefAt = 0
 --  einzelnen Ausreissern gedaempft. "Fuer kurze Zeit stabil bleiben,
 --  statt zu zittern" - genau dieser kurze Nachlauf.
 local SCHRITT = 0.55
+
+--  BEI EINEM GROSSEN SPRUNG SOFORT, NICHT ERST NACH EIN PAAR BILDERN.
+--
+--  SCHRITT=0.55 ist fuer genau das gedacht, was der Kommentar oben
+--  beschreibt: das Restrauschen UNTER der geglaetteten Kamera-Drehrate,
+--  typischerweise ein Bruchteil bis ein paar Pixel. Bei den meisten
+--  Schildern (Generatoren, Spielerkoepfe) ist das die GANZE Bewegung, die
+--  hier je Bild ankommt - die Kamera-Vorhersage (SP.lookahead/predictCam)
+--  hat den grossen Teil schon herausgerechnet.
+--
+--  Ein Schild an einem sich selbst bewegenden Ziel (z.B. eine Biene, Adornee
+--  = ein Teil, das im wirklichen Sinn durch die Welt fliegt) bekommt JEDE
+--  Bewegung des Ziels SELBST obendrauf - die Kamera-Vorhersage kennt ja nur
+--  die Kamera, nicht das Ziel. Dreht man dazu noch den Screen, addieren
+--  sich beide Anteile: der Rohwert kann dann ganze zig Pixel je Bild
+--  springen, weit ueber das Rauschen hinaus, das SCHRITT eigentlich
+--  daempfen soll. Mit einem festen SCHRITT braucht ein solcher Sprung dann
+--  mehrere Bilder, um einzuholen, und genau DAS sieht aus wie ein
+--  nachziehendes/verschmiertes Schild - gemeldet an der Biene, deren
+--  kleines Icon jeden Pixel Nachlauf besonders sichtbar macht, aber vom
+--  Prinzip her jedes selbst bewegte Ziel betrifft.
+--
+--  Deshalb ab hier ein GLEITENDER Uebergang statt eines festen SCHRITT:
+--  bis SCHRITT_RAMP_LO (4px) bleibt es beim bisherigen sanften 0,55 -
+--  echtes Rauschen sieht diese Aenderung also gar nicht. Ab
+--  SCHRITT_RAMP_HI (40px) wird der ganze Sprung in einem einzigen Bild
+--  genommen (SCHRITT effektiv 1) - ein Sprung dieser Groesse ist ohnehin
+--  keine Kamera-Unruhe mehr, sondern eine echte neue Stelle. Dazwischen
+--  linear vermittelt, damit es keinen harten Wechsel bei einer bestimmten
+--  Pixelzahl gibt.
+local SCHRITT_RAMP_LO, SCHRITT_RAMP_HI = 4, 40
 local function halte(gui, x, y)
 	local h = held[gui]
 	if not h then
@@ -1295,11 +1723,18 @@ local function halte(gui, x, y)
 		held[gui] = h
 		return x, y
 	end
-	if math.abs(x - h.x) < HALTE and math.abs(y - h.y) < HALTE then
+	local dx, dy = x - h.x, y - h.y
+	if math.abs(dx) < HALTE and math.abs(dy) < HALTE then
 		return h.x, h.y
 	end
-	h.x = h.x + (x - h.x) * SCHRITT
-	h.y = h.y + (y - h.y) * SCHRITT
+	local schritt = SCHRITT
+	local delta = math.max(math.abs(dx), math.abs(dy))
+	if delta > SCHRITT_RAMP_LO then
+		local t = math.min(1, (delta - SCHRITT_RAMP_LO) / (SCHRITT_RAMP_HI - SCHRITT_RAMP_LO))
+		schritt = SCHRITT + (1 - SCHRITT) * t
+	end
+	h.x = h.x + dx * schritt
+	h.y = h.y + dy * schritt
 	return h.x, h.y
 end
 
@@ -1340,23 +1775,50 @@ end
 --  Vergleichsfunktion). Stattdessen wird pro Schild NUR DIE MESSUNG
 --  selbst beruhigt: SP._zSort haelt je Schild die zuletzt GENUTZTE Tiefe
 --  fest und uebernimmt den neuen rohen Wert erst, wenn er sich klar davon
---  entfernt hat (> 8 % bzw. mind. 1 Stud) - kleines Rauschen faellt raus,
---  eine echte Annaeherung oder Entfernung schlaegt weiterhin voll durch,
---  und "weiter weg" bedeutet ab da wieder ausnahmslos "weiter hinten".
+--  entfernt hat (> 4 % bzw. mind. 0,6 Stud) - kleines Rauschen faellt
+--  raus, eine echte Annaeherung oder Entfernung schlaegt weiterhin voll
+--  durch, und "weiter weg" bedeutet ab da wieder ausnahmslos "weiter
+--  hinten".
+--
+--  8 %/1 Stud (die urspruengliche Schwelle) war GROSSZUEGIGER bemessen,
+--  als es dieser eine Fall (208 vs. 207 Stud) gebraucht haette - auf der
+--  C#-Seite gemeldet als "beim Ueberlappen trifft es noch keine klare
+--  Entscheidung, das soll schneller reagieren". Seit OverlayWindow.cs
+--  (_tagZPrev) ohnehin nur bei einer TATSAECHLICHEN Ordnungsaenderung neu
+--  einsortiert, statt bei jedem Bild, traegt die Schwelle hier nicht mehr
+--  die ganze Last gegen sichtbares Zittern allein - sie darf enger sein.
+--  Faellt der urspruengliche 207-vs-208-Fall zurueck (staendiges Kippen
+--  bei praktisch gleichem Abstand), ist DAS das Zeichen, hier wieder
+--  hochzugehen - nicht andersherum.
+--  Die Vergleichsfunktion fuer die Tiefensortierung einmal angelegt statt je
+--  Bild eine neue Closure.
+local function byDepthFar(a, b) return a.zs > b.zs end
+
 local function sortDepthOf(zSort, c)
 	local id = idOf(c.gui)
 	local prev = zSort[id]
-	if not prev or math.abs(c.z - prev) > math.max(1, prev * 0.08) then
+	--  Schwelle 0,25 Stud / 1,2 % statt 0,6 Stud / 4 %: die Reihenfolge soll der
+	--  Kamera zuegig folgen. Das Rauschen, wegen dem die grosse Schwelle
+	--  stand, kam aus der VORHERGESAGTEN Kamera - c.z ist inzwischen die rohe
+	--  Entfernung (siehe rawDepth in serializeTags) und ruhig. Der Fall 208
+	--  gegen 207 Stud (0,5 %) kippt damit weiterhin nicht.
+	if not prev or math.abs(c.z - prev) > math.max(0.25, prev * 0.012) then
 		zSort[id] = c.z
 		return c.z
 	end
 	return prev
 end
 
-local function serializeTags()
-	if busy then return "[]", 0 end
+--  raw = true: liefert nur den Inhalt OHNE die aeusseren eckigen Klammern (der
+--  Aufrufer setzt ihn selbst in den Rahmen, siehe frameText). Jede Zeichenkette
+--  von der Groesse des ganzen Bildes, die zusaetzlich entsteht, ist Speicher,
+--  den der Garbage Collector wieder einsammeln muss - und dessen Arbeit
+--  kommt als Ruckler an. Das Umklammern allein war eine volle Kopie je Bild.
+local function serializeTags(raw)
+	local leer = raw and "" or "[]"
+	if busy then return leer, 0 end
 	local cam = workspace.CurrentCamera
-	if not cam then return "[]", 0 end
+	if not cam then return leer, 0 end
 
 	--  Panel offen: keine Welt-Schilder. Siehe panelOffen() darueber.
 	if panelOffen() then
@@ -1364,12 +1826,22 @@ local function serializeTags()
 		if not st then st = {}; SP.stat = st end
 		st.kandidaten, st.gezeigt, st.panelOffen = 0, 0, true
 		SP.tagsShown, SP.tagsHidden = 0, 0
-		return "[]", 0
+		return leer, 0
 	end
 
 	busy = true
 	buf, bn = {}, 0
-	local eye = cam.CFrame.Position
+	--  Die Kamera EINMAL lesen: cam.CFrame ist je Zugriff ein Aufruf in die
+	--  Engine plus eine neue CFrame-Instanz, und stand bisher je Schild und
+	--  Bild noch einmal in der Tiefenberechnung unten.
+	local camCF = cam.CFrame
+	local eye  = camCF.Position
+	local pt = PROF.on and os.clock() or nil   -- Messuhr, siehe PROF
+	--  Verdeckungs-Schalter vorn gelesen: die Pill-Flaeche (unten) wird nur
+	--  gebraucht, wenn eines von beiden an ist.
+	local schwelle = SP.declutter
+	local fadeMax = SP.occlusionFade
+	local braucheFlaeche = schwelle > 0 or fadeMax > 0
 
 	--  EINMAL je Bild die Kamera vorausrechnen, danach ALLE Schilder damit
 	--  projizieren. Genau daran haengt, dass sie sich gemeinsam und starr
@@ -1377,6 +1849,17 @@ local function serializeTags()
 	local camPred = predictCam(cam, os.clock())
 	local fov     = cam.FieldOfView
 	local vpx, vpy = cam.ViewportSize.X, cam.ViewportSize.Y
+
+	--  WIE WEIT EIN SCHILD LINKS/OBEN UEBER DIE KANTE HINAUS NOCH ALS
+	--  "SICHTBAR" ZAEHLEN DARF - SIEHE DIE BEGRUENDUNG WEITER UNTEN BEIM
+	--  EIGENTLICHEN TEST.
+	--
+	--  100/80 sind keine frei erfundenen Werte - sie MUESSEN zu
+	--  TAG_OX/TAG_OY in OverlayWindow.cs passen (dort dieselben "logischen"
+	--  Pixel, vor der DPI-Skalierung - cam.ViewportSize hier ist exakt
+	--  dieselbe Einheit). Aendert sich der eine Wert, muss der andere
+	--  mitziehen.
+	local TAG_PUFFER_X, TAG_PUFFER_Y = 100, 80
 
 	--  Erst sammeln, dann entscheiden, dann zeichnen. Das Sammeln ist
 	--  billig (eine Projektion je Schild); teuer ist erst das Ablesen des
@@ -1401,6 +1884,7 @@ local function serializeTags()
 		if typeof(gui) ~= "Instance" or gui.Parent == nil then
 			SP.tags[gui] = nil
 			SP.want[gui] = nil
+			TAGC[gui] = nil
 		elseif SP.want[gui] == false then
 			nWant += 1
 			--  Ausgefiltert: das Schild steht noch da, das Hauptskript will
@@ -1433,6 +1917,41 @@ local function serializeTags()
 				if dist <= maxd then
 					local px, py, depth = project(camPred, fov, vpx, vpy, world)
 					if not px then nHinten += 1 end
+					--  FUER DIE REIHENFOLGE (c.z unten): DIE ROHE KAMERA, NICHT
+					--  DIE VORHERGESAGTE.
+					--
+					--  "depth" oben kommt aus camPred - der paar Millisekunden
+					--  VORAUSGERECHNETEN Kamera (siehe predictCam/SP.lookahead),
+					--  damit ein Schild beim schnellen Schwenk nicht sichtbar
+					--  hinterherzieht. Fuer die PLATZIERUNG ist das genau
+					--  richtig. Fuer die REIHENFOLGE zwischen zwei Schildern
+					--  ist es das nicht: die Vorhersage extrapoliert die
+					--  DREHUNG, und schon eine minimale, staendig leicht
+					--  schwankende Korrektur an der angenommenen Blickrichtung
+					--  verschiebt "depth" (die Ausdehnung ENTLANG dieser
+					--  Blickrichtung) fuer zwei ungefaehr gleich weit entfernte,
+					--  aber unterschiedlich weit zur Seite stehende Schilder
+					--  UNTERSCHIEDLICH stark - genug, um die Rangfolge
+					--  zwischendurch kippen zu lassen, obwohl sich an der
+					--  wahren Position beider nichts geaendert hat. Gemeldet
+					--  als sichtbares Zittern der Reihenfolge selbst beim
+					--  Kamerabewegen ("statt dieser festen Rangfolge zittert
+					--  das noch etwas - nimm die Position meiner Kamera").
+					--  Die ECHTE, ungefilterte Kamera kennt diese Korrektur
+					--  nicht und liefert darum einen ruhigen Wert, der sich
+					--  nur dann aendert, wenn sich Kamera oder Schild
+					--  tatsaechlich bewegen.
+					--  ENTFERNUNG VON DER KAMERA, NICHT TIEFE ENTLANG DER BLICKRICHTUNG.
+					--
+					--  Frueher stand hier die Tiefe entlang der Blickachse
+					--  (PointToObjectSpace(...).Z). Fuer Schilder am Bildrand
+					--  weicht die von der wahren Entfernung ab - ein Schild
+					--  seitlich, aber naeher an der Kamera, galt als weiter
+					--  hinten. Gemeint ist immer "was der Kamera am naechsten
+					--  ist, liegt vorn": also die Entfernung von der Kamera
+					--  selbst. dist steht oben schon fertig da, das kostet
+					--  nichts extra.
+					local rawDepth = dist
 					if px then
 						--  GROESSE UEBER AbsoluteSize, NICHT UEBER Size.Offset.
 						--
@@ -1472,10 +1991,16 @@ local function serializeTags()
 						--  "kollabierte Box" weiter unten im Code) faellt sie
 						--  selbst auf 0 zurueck; genau dann greift Offset
 						--  als Ersatzwert.
-						local size = gui.Size
+						--  gui.Size wird nur noch gelesen, wenn AbsoluteSize (noch)
+						--  0 ist - der Regelfall braucht es nicht.
 						local absSize = gui.AbsoluteSize
-						local bw = absSize.X > 0 and absSize.X or size.X.Offset
-						local bh = absSize.Y > 0 and absSize.Y or size.Y.Offset
+						local bw, bh = absSize.X, absSize.Y
+						local flach = bw < 1
+						if bw <= 0 or bh <= 0 then
+							local size = gui.Size
+							if not (bw > 0) then bw = size.X.Offset end
+							if not (bh > 0) then bh = size.Y.Offset end
+						end
 
 						--  NICHT MEHR AUF DEM WELT-VERSATZ ZENTRIEREN - AUF EINEM
 						--  MINDESTABSTAND ZUM KOPF SELBST.
@@ -1508,7 +2033,8 @@ local function serializeTags()
 						local headY = hpy or py
 						local naturalGap = hpy and (headY - py) or 0
 						local gap = math.max(naturalGap, SP.tagMinHeadGap)
-						local ox, oy = halte(gui, px - bw * 0.5, headY - gap - bh)
+						local rawX, rawY = px - bw * 0.5, headY - gap - bh
+						local ox, oy = halte(gui, rawX, rawY)
 						--  RANDPUFFER statt "on".
 						--
 						--  "on" ist schon dann false, wenn der projizierte
@@ -1519,14 +2045,73 @@ local function serializeTags()
 						--  als "wenn ich nicht hingucke, gibt es die auch
 						--  nicht". Also wird die ganze Box geprueft, nicht
 						--  der Punkt.
-						if not (ox + bw >= 0 and ox <= vpx and oy + bh >= 0 and oy <= vpy) then
+						--
+						--  GEPRUEFT WIRD DIE ROHE POSITION (rawX/rawY), NICHT DIE
+						--  GEGLAETTETE (ox/oy aus halte()).
+						--
+						--  halte() daempft nur die paar Pixel Kamera-Rauschen -
+						--  bei einem SCHNELLEN Kameraschwenk (z.B. am Rand eines
+						--  Daches vorbei) hinkt sie der wahren Position dagegen
+						--  mehrere Bilder lang hinterher (55% Angleichung je Bild,
+						--  siehe SCHRITT). Wurde hier bisher GEGEN ox/oy geprueft,
+						--  blieb das Schild sichtbar UND WANDERTE SICHTBAR RICHTUNG
+						--  Bildrand, bis die geglaettete Position selbst endlich
+						--  aus dem Bild rutschte - gemeldet als "es aendert aktiv
+						--  die Position, bis es dann weg ist" statt sauber an
+						--  Ort und Stelle zu verschwinden (wie Roblox es fuer die
+						--  echten, unversteckten Schilder taete - dort schneidet
+						--  einfach der Bildschirmrand). Die rohe Position kennt
+						--  dieses Nachhinken nicht, verschwindet also GENAU dann,
+						--  wenn die wahre Stelle das Bild wirklich verlaesst. Fuer
+						--  die tatsaechliche PLATZIERUNG (unten, c.ox/c.oy) bleibt
+						--  weiterhin die geglaettete ox/oy in Gebrauch - das
+						--  Zittern soll ja gedaempft bleiben, nur die Sichtbarkeits-
+						--  Entscheidung selbst nicht.
+						--  LINKS/OBEN ZUSAETZLICH AUF DEN C#-PUFFER BEGRENZT.
+						--
+						--  Ohne "rawX >= -TAG_PUFFER_X"/"rawY >= -TAG_PUFFER_Y"
+						--  zaehlt die Box als sichtbar, solange irgendein Stueck
+						--  noch im Bild waere - auch bis zu ihrer vollen
+						--  Breite/Hoehe jenseits der Kante. Auf der C#-Seite wird
+						--  die Schild-Stelle (ax/ay in OverlayWindow.cs) aber an
+						--  der Roblox-Kante GEKLEMMT statt an ihrer wahren
+						--  (negativen) Stelle gezeichnet - ein Schild, dessen
+						--  Stelle nur einen Pixel jenseits der Kante liegt, sprang
+						--  bislang komplett dorthin und blieb dort haengen, bis es
+						--  hier endlich als "nicht mehr sichtbar" herausfiel. Bei
+						--  einer Kamera nahe der Kante heisst das: staendig
+						--  zwischen wahrer Stelle und Kante hin- und herspringen -
+						--  gemeldet als "rutscht" statt sauber zu verschwinden
+						--  (siehe die Begruendung oben bei rawX/rawY).
+						--
+						--  FRUEHER STAND HIER: "Rechts/unten kommt das nicht
+						--  vor, dort liegt rawX<=vpx ohnehin schon innerhalb
+						--  dessen, was die C#-Seite ungeklemmt zeichnen
+						--  kann." Das war schlicht falsch - die C#-Seite
+						--  klemmte dort ueberhaupt nichts: ihr Schild-Fenster
+						--  ist mit TAG_W/TAG_H fest groesser als der Inhalt
+						--  und ragt ohne eigene Begrenzung bis zu
+						--  (TAG_W-|TAG_OX|)/(TAG_H-|TAG_OY|) Pixel ueber die
+						--  Kante hinaus - bei hoher DPI-Skalierung genug, um
+						--  auf einem danebenliegenden zweiten Monitor
+						--  sichtbar zu werden. Behoben in OverlayWindow.cs
+						--  (UpdateTagWindows: die Fenster-BOX wird jetzt
+						--  selbst bei freiem Roblox-Fenster auf dessen
+						--  eigene Flaeche geklemmt), nicht hier - diese
+						--  Pruefung hier entscheidet nur, ob ueberhaupt ein
+						--  C#-Fenster fuer dieses Schild angelegt wird, nicht
+						--  mehr, ob dabei etwas ueberstehen darf.
+						local sichtbar = rawX + bw >= 0 and rawX >= -TAG_PUFFER_X and rawX <= vpx
+							and rawY + bh >= 0 and rawY >= -TAG_PUFFER_Y and rawY <= vpy
+						if not sichtbar then
 							nAusserhalb += 1
 						end
-						if ox + bw >= 0 and ox <= vpx and oy + bh >= 0 and oy <= vpy then
+						if sichtbar then
 							cn += 1
 							local c = pool[cn]
 							if not c then c = {}; pool[cn] = c end
-							c.gui, c.ox, c.oy, c.bw, c.bh, c.z, c.drop, c.fade = gui, ox, oy, bw, bh, depth, false, 0
+							c.gui, c.ox, c.oy, c.bw, c.bh, c.z, c.drop, c.fade = gui, ox, oy, bw, bh, rawDepth, false, 0
+							c.flat = flach
 
 							--  FUER DIE VERDECKUNGSPRUEFUNG: DIE TATSAECHLICH
 							--  SICHTBARE FLAECHE, NICHT DIE SCHILD-BOX.
@@ -1549,14 +2134,22 @@ local function serializeTags()
 							--  Basis), dann auf dieselbe Stelle wie ox/oy
 							--  umgerechnet (die eigene Projektion, nicht Robloxs).
 							c.fx, c.fy, c.fw, c.fh = ox, oy, bw, bh
-							local pill = gui:FindFirstChild("Pill")
-							if pill and pill:IsA("GuiObject") then
-								local pas = pill.AbsoluteSize
-								if pas.X > 0 and pas.Y > 0 then
-									local gap = gui.AbsolutePosition
-									c.fw, c.fh = pas.X, pas.Y
-									c.fx = ox + (pill.AbsolutePosition.X - gap.X)
-									c.fy = oy + (pill.AbsolutePosition.Y - gap.Y)
+							--  NUR WENN DIE VERDECKUNG AN IST (braucheFlaeche): die
+							--  Pill-Flaeche dient allein der Ueberdeckungspruefung
+							--  unten, und die laeuft in der Grundeinstellung gar nicht
+							--  (SP.declutter = 0, SP.occlusionFade = 0). Fuenf
+							--  Engine-Aufrufe je Schild und Bild fuer ein Ergebnis, das
+							--  niemand las.
+							if braucheFlaeche then
+								local pill = gui:FindFirstChild("Pill")
+								if pill and pill:IsA("GuiObject") then
+									local pas = pill.AbsoluteSize
+									if pas.X > 0 and pas.Y > 0 then
+										local gap = gui.AbsolutePosition
+										c.fw, c.fh = pas.X, pas.Y
+										c.fx = ox + (pill.AbsolutePosition.X - gap.X)
+										c.fy = oy + (pill.AbsolutePosition.Y - gap.Y)
+									end
 								end
 							end
 
@@ -1567,6 +2160,8 @@ local function serializeTags()
 			end
 		end
 	end
+
+	if pt then pt = profMark(pt, "tags.1 sammeln+projizieren") end
 
 	--  Reste des letzten Bildes abschneiden: table.sort wuerde sie sonst
 	--  mitsortieren und Schilder von vorhin wieder hereinholen.
@@ -1600,7 +2195,7 @@ local function serializeTags()
 		local zSort = SP._zSort
 		if not zSort then zSort = {}; SP._zSort = zSort end
 		for i = 1, cn do cand[i].zs = sortDepthOf(zSort, cand[i]) end
-		table.sort(cand, function(a, b) return a.zs > b.zs end)
+		table.sort(cand, byDepthFar)
 
 		--  Alle paar hundert Bilder aufraeumen statt jedes Mal: eine
 		--  ganz normale, ueber Zahlen-Ids indizierte Tabelle wird von Lua
@@ -1629,8 +2224,6 @@ local function serializeTags()
 		SP._keep = keep
 	end
 	local keptX, keptY, keptW, keptH, kept = keep.x, keep.y, keep.w, keep.h, 0
-	local schwelle = SP.declutter
-	local fadeMax = SP.occlusionFade
 
 	--  VERDECKUNG PRUEFEN - GEGENLAEUFIG ZUR SORTIERUNG.
 	--
@@ -1684,7 +2277,17 @@ local function serializeTags()
 		kept = 0   -- fuer die Emission unten neu gezaehlt
 	end
 
+	if pt then pt = profMark(pt, "tags.2 sortieren+verdecken") end
+
 	--  EMISSION - WEITESTE ZUERST, WIE GEHABT (Fenster-Stapel-Reihenfolge).
+	--
+	--  prims zaehlt die Befehle dieses Bildes (Gruppenkoepfe + Kinderbefehle) -
+	--  frueher war das schlicht bn, aber die Kinderbefehle eines Schildes
+	--  stecken jetzt als ein einziger Text im Puffer (siehe TAGC).
+	local nowT = os.clock()
+	local ttl = math.clamp(frameDt * TAG_TTL_FRAMES, TAG_TTL_MIN, TAG_TTL_MAX)
+	SP.tagTtl = ttl
+	local prims = 0
 	for i = 1, cn do
 		local c = cand[i]
 
@@ -1692,39 +2295,102 @@ local function serializeTags()
 			kept += 1
 
 			local gui, ox, oy, bw, bh = c.gui, c.ox, c.oy, c.bw, c.bh
+			local id = idOf(gui)
 
 			--  GRUPPENKOPF: Kennung und Stelle des Schildes.
 			--
 			--  Danach folgen seine Kinder mit Koordinaten RELATIV zur
 			--  Schild-Box. Damit ist der Inhalt von der Stelle getrennt: das
 			--  Programm kann das Schild verschieben, ohne es neu zu zeichnen.
-			put(('{"k":"g","i":%d,"x":%s,"y":%s,"w":%s,"h":%s}')
-				:format(idOf(gui), num(ox), num(oy), num(bw), num(bh)))
-			--  KOLLABIERTE BOX NACHRECHNEN.
 			--
-			--  Ein BillboardGui, das Roblox noch nie gezeichnet hat, hat
-			--  AbsoluteSize 0x0 - dann loesen alle Kinder, die ihre Position
-			--  in Scale angeben, gegen null auf. Nachgemessen an einem
-			--  Namensschild: im Bild Pille @ 82,66, nie gezeichnet @ -26,-34.
-			--  Das trifft die Schilder, die ENTSTEHEN, waehrend die Bruecke
-			--  laeuft - sie werden sofort abgeschaltet, also nie gezeichnet,
-			--  und korrigieren sich nie von selbst. Der fehlende Betrag ist
-			--  genau der Scale-Anteil an der Box.
-			--  ox/oy gehen NICHT mehr mit: die Kinder werden relativ zur
-			--  Schild-Box geschickt, die Stelle steht im Gruppenkopf.
-			local flach = gui.AbsoluteSize.X < 1
-			for _, ch in ipairs(gui:GetChildren()) do
-				if ch:IsA("GuiObject") then
-					if flach then
-						local pp = ch.Position
-						emit(ch, bw * pp.X.Scale, bh * pp.Y.Scale, c.fade)
-					else
-						emit(ch, 0, 0, c.fade)
+			--  EIN format-Aufruf statt fuenf (num() je Zahl ruft selbst noch
+			--  floor und format): das hier laeuft je Schild in JEDEM Bild, und
+			--  jede so entstandene Zeichenkette ist Arbeit fuer den
+			--  Garbage Collector. %.2f statt ganzer Zahlen ohne Nachkommastellen
+			--  macht das JSON um ein paar Zeichen laenger, aendert aber keinen
+			--  Wert - der Leser rechnet mit Zahlen, nicht mit Text.
+			put(('{"k":"g","i":%d,"x":%.2f,"y":%.2f,"w":%.2f,"h":%.2f}')
+				:format(id, ox, oy, bw, bh))
+			prims += 1
+
+			--  Verblassen in Stufen (FADE_STEPS): der Zwischenspeicher gilt nur
+			--  fuer GENAU diese Stufe. Ohne Ueberdeckung (Grundeinstellung) ist
+			--  fq immer 0.
+			local fq = 0
+			if c.fade > 0 then fq = math.floor(c.fade * FADE_STEPS + 0.5) end
+
+			local ent = TAGC[gui]
+			if ent and ent.bw == bw and ent.bh == bh and ent.fq == fq and nowT < ent.exp then
+				--  Treffer: derselbe Inhalt wie vor ein, zwei Bildern - keine
+				--  einzige Eigenschaft wird gelesen.
+				local s = ent.s
+				if s then put(s) end
+				prims += ent.n
+			else
+				local fade = fq / FADE_STEPS
+				local b0 = bn
+				--  KOLLABIERTE BOX NACHRECHNEN.
+				--
+				--  Ein BillboardGui, das Roblox noch nie gezeichnet hat, hat
+				--  AbsoluteSize 0x0 - dann loesen alle Kinder, die ihre Position
+				--  in Scale angeben, gegen null auf. Nachgemessen an einem
+				--  Namensschild: im Bild Pille @ 82,66, nie gezeichnet @ -26,-34.
+				--  Das trifft die Schilder, die ENTSTEHEN, waehrend die Bruecke
+				--  laeuft - sie werden sofort abgeschaltet, also nie gezeichnet,
+				--  und korrigieren sich nie von selbst. Der fehlende Betrag ist
+				--  genau der Scale-Anteil an der Box.
+				--  ox/oy gehen NICHT mehr mit: die Kinder werden relativ zur
+				--  Schild-Box geschickt, die Stelle steht im Gruppenkopf.
+				--  (c.flat wurde beim Sammeln aus derselben AbsoluteSize
+				--  abgeleitet - dasselbe Bild, ein Aufruf weniger.)
+				local flach = c.flat
+				local list = gui:GetChildren()
+				for k = 1, #list do
+					local ch = list[k]
+					if isGuiObject(ch, ch.ClassName) then
+						if flach then
+							local pp = ch.Position
+							emit(ch, bw * pp.X.Scale, bh * pp.Y.Scale, fade)
+						else
+							emit(ch, 0, 0, fade)
+						end
 					end
 				end
+
+				--  Die frisch gebauten Befehle zu EINEM Text zusammenfassen und
+				--  merken. Die Einzelteile aus dem Puffer nehmen und den einen
+				--  Text an ihre Stelle setzen: so geht das Schild wie vorher
+				--  komma-getrennt in den Gesamttext.
+				local n = bn - b0
+				local joined = false
+				if n > 0 then
+					joined = table.concat(buf, ",", b0 + 1, bn)
+					for k = bn, b0 + 1, -1 do buf[k] = nil end
+					bn = b0 + 1
+					buf[bn] = joined
+				end
+				if not ent then ent = {}; TAGC[gui] = ent end
+				--  RUHIGE SCHILDER SELTENER LESEN. Kam beim Lesen exakt dasselbe
+				--  wie beim letzten Mal heraus, gilt der naechste Inhalt bis zu
+				--  dreimal so lange (hoechstens 100 ms) - ein Schild, das steht
+				--  (Name, Kit, Ruestung), muss nicht dreissig Mal je Sekunde
+				--  nachgeprueft werden. Aendert es sich, ist sofort wieder der
+				--  kurze Takt da.
+				local calm = 0
+				if ent.s == joined and ent.bw == bw and ent.bh == bh and ent.fq == fq then
+					calm = math.min((ent.calm or 0) + 1, 3)
+				end
+				ent.s, ent.n, ent.bw, ent.bh, ent.fq, ent.calm = joined, n, bw, bh, fq, calm
+				--  Bis zu 36 % Versatz je Schild, damit nicht alle im selben
+				--  Bild ablaufen (siehe TAGC).
+				ent.exp = nowT + math.max(ttl, math.min(ttl * (1 + calm), 0.1))
+					* (1 + (id % 5) * 0.09)
+				prims += n
 			end
 		end
 	end
+
+	if pt then pt = profMark(pt, "tags.3 emit (Baum lesen+JSON)") end
 
 	SP.tagsShown, SP.tagsHidden = kept, cn - kept
 	local st = SP.stat
@@ -1737,7 +2403,15 @@ local function serializeTags()
 	for i = 1, cn do pool[i].gui = nil end
 
 	busy = false
-	return "[" .. table.concat(buf, ",") .. "]", bn
+	--  Der Bereich (1, bn) ist Pflicht: der Puffer kann hinter bn noch
+	--  Ueberbleibsel enthalten.
+	local out = table.concat(buf, ",", 1, bn)
+	if not raw then out = "[" .. out .. "]" end
+	if pt then
+		profMark(pt, "tags.4 verketten")
+		profAdd("tags.anzahl sichtbar", cn)
+	end
+	return out, prims
 end
 
 --------------------------------------------------------------------
@@ -1850,17 +2524,45 @@ end
 --  Neuaufbauten still - jeden Frame dasselbe zu schicken waere ein
 --  Vielfaches an Last fuer null Unterschied. Die Tags dagegen wandern mit
 --  der Kamera und gehen jeden Frame raus; sie sind klein.
-local function frameText(screen, tags, sameScreen)
+--  tagsBody: der Inhalt des "w"-Feldes OHNE eckige Klammern (serializeTags(true)).
+local function frameText(screen, tagsBody, sameScreen)
 	local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
 		or Vector2.new(1920, 1080)
 	local head = ('{"v":1,"t":%s,"vw":%s,"vh":%s')
 		:format(num(os.clock() * 1000), num(vp.X), num(vp.Y))
+	--  EINE Verkettung fuer das ganze Paket, nicht Kopf + Panel + Tags in
+	--  Schritten (jeder Schritt waere eine weitere Kopie).
 	if sameScreen or screen == nil then
-		head = head .. ',"sk":1'
-	else
-		head = head .. ',"s":' .. screen
+		return head .. ',"sk":1,"w":[' .. (tagsBody or "") .. "]}"
 	end
-	return head .. ',"w":' .. (tags or "[]") .. "}"
+	return head .. ',"s":' .. screen .. ',"w":[' .. (tagsBody or "") .. "]}"
+end
+
+--  Die Auswertung des Auto-Reglers (Erklaerung bei SP.setAuto oben). Laeuft
+--  alle 0,5 s aus der Hauptschleife, nicht je Bild.
+local function autoEval()
+	local A = AUTO
+	if not A.tagEma then return end
+	local fps  = 1 / math.max(frameDt, 0.001)
+	local pass = A.tagEma + (A.sendEma or 0)   -- ms je gesendetem Bild
+
+	--  Hoechste Stufe, deren Last ins Budget passt (0 = jedes Bild = fps).
+	local pick = #AUTO_LADDER
+	for i, r in ipairs(AUTO_LADDER) do
+		local rate = (r == 0) and fps or math.min(r, fps)
+		if rate * pass <= AUTO_BUDGET * 1000 then pick = i; break end
+	end
+	--  Aufwaerts nur eine Stufe je Schritt.
+	if pick < A.cur then pick = A.cur - 1 end
+
+	if pick == A.cur then A.want, A.votes = pick, 0; return end
+	if A.want ~= pick then A.want, A.votes = pick, 0 end
+	A.votes += 1
+	--  Abwaerts (weniger senden) nach 1 s, aufwaerts nach 3 s.
+	if A.votes >= ((pick > A.cur) and 2 or 6) then
+		A.cur, A.votes = pick, 0
+		SP.rate.tags = AUTO_LADDER[pick]
+	end
 end
 
 local function startLoop()
@@ -1868,9 +2570,23 @@ local function startLoop()
 		local sock, useWs = nil, false
 		local lastScreen  = nil
 		local panelAt, httpAt = 0, 0
+		local idleGap = nil   -- Abstand der Leerlauf-Durchlaeufe, siehe "Sicherheitsnetz" unten
+		local lastNow = os.clock()
+		local lastTags, lastN2 = "", 0   -- letzter Schild-Stand fuer gedrosselte Bilder
+		local autoAt = 0                 -- naechste Auswertung des Auto-Reglers
+		local slice = nil     -- laufendes Scheibchen des Leerlauf-Durchlaufs, siehe sliceBegin
+		--  Zeit je Bild fuer das Scheibchen. 0,5 ms: auf diesem Rechner ein
+		--  Achtel der Bilddauer, auf einem langsameren nimmt dieselbe Zeit
+		--  einfach weniger Elemente - der Durchlauf dauert dann mehr Bilder,
+		--  jedes Bild bleibt gleich glatt.
+		local SLICE_BUDGET = 0.0005
 		local tagAt = 0
 		local lastPulse = nil
 		local busyUntil = 0
+		--  Siehe "settling" weiter unten: bis zu diesem Zeitpunkt bleibt
+		--  "due" nach einem SP.touch() erzwungen, nicht nur fuer EINEN
+		--  Durchlauf.
+		local settleUntil = 0
 		local frames, fpsAt = 0, os.clock()
 		local sentCount = 0
 		local fails = 0
@@ -1944,7 +2660,7 @@ local function startLoop()
 							SP.setActive(false, "Knopf im Programm")
 						end)
 					elseif cmd.cmd == "rate" then
-						SP.setRate(cmd.tags, cmd.panel)
+						SP.setRate(cmd.tags, cmd.panel, cmd.auto)
 					elseif cmd.cmd == "profile" then
 						SP.setProfile(tostring(cmd.name))
 						print("[Streamproof] Leistungsstufe: " .. tostring(SP.profile))
@@ -1963,8 +2679,13 @@ local function startLoop()
 		SP.ws = useWs
 
 		while SP.active do
+			local lt0 = PROF.on and os.clock() or nil   -- Gesamtdauer dieses Durchlaufs
 			local okAll = pcall(function()
 				local now = os.clock()
+				--  Bilddauer nachfuehren (siehe TAG_TTL_MIN). Ein Ausreisser
+				--  (Ladehaenger, Alt-Tab) zaehlt hoechstens als 100 ms.
+				frameDt = frameDt * 0.9 + math.min(now - lastNow, 0.1) * 0.1
+				lastNow = now
 
 				--  Ist die schnelle Leitung weg, alle zwei Sekunden einen
 				--  neuen Anlauf. Der HTTP-Weg traegt derweil weiter, aber er
@@ -1987,18 +2708,49 @@ local function startLoop()
 				--  Tags: voller Takt. Eine Drosselung ist moeglich, aber
 				--  nicht empfohlen - das ist der Teil, der sich bei jeder
 				--  Mausbewegung aendert.
-				local tags, n2 = "[]", 0
+				--  Bei gedrosselter Schild-Rate (Einstellung oder Auto) steht in den
+				--  Bildern dazwischen der LETZTE Stand (lastTags). Frueher war es
+				--  ein leerer Inhalt - ging in so einem Bild trotzdem ein
+				--  Panel-Update raus, trug es "w":[] und die Schilder waeren fuer
+				--  dieses Bild verschwunden (Flackern). tagsFresh sagt, ob dieses
+				--  Bild ueberhaupt neue Schild-Positionen hat.
+				local tags, n2, tagsFresh = lastTags, lastN2, false   -- Inhalt ohne Klammern, siehe serializeTags(true)
 				local tagStep = (SP.rate.tags > 0) and (1 / SP.rate.tags) or 0
-				if now - tagAt >= tagStep then
+				--  Halbe Bilddauer Toleranz: bei 120 Hz und 240 Bildern soll es
+				--  exakt jedes zweite Bild sein, nicht nach Zufall des Zitterns.
+				if now - tagAt >= tagStep - frameDt * 0.5 then
 					tagAt = now
-					tags, n2 = serializeTags()
+					--  GEMESSEN, NICHT GERATEN - siehe serializeScreen()
+					--  unten (SP.panelMs) fuer dieselbe Ueberlegung. Bisher
+					--  gab es fuer diesen Aufruf keinerlei Kostenzahl
+					--  waehrend die Bruecke wirklich laeuft (SP.debugFrame()
+					--  misst tagMs nur einmalig, und nur solange die Bruecke
+					--  AUS ist) - ob serializeTags() selbst spuerbar am
+					--  eigenen Bild-Budget von Roblox zehrt (die Funktion
+					--  laeuft ja synchron in RenderStepped, VOR dem
+					--  Praesentieren dieses Bildes), war bislang reine
+					--  Vermutung. SP.tagMs macht daraus eine Zahl, die die
+					--  App genauso wie SP.panelMs abfragen kann.
+					local tt0 = os.clock()
+					tags, n2 = serializeTags(true)
+					SP.tagMs = (os.clock() - tt0) * 1000
+					if PROF.on then profAdd("tags.gesamt", SP.tagMs) end
+					lastTags, lastN2, tagsFresh = tags, n2, true
+					--  Auto braucht die Kosten je Durchlauf (gleitend).
+					AUTO.tagEma = AUTO.tagEma and (AUTO.tagEma * 0.95 + SP.tagMs * 0.05) or SP.tagMs
+				end
+				if AUTO.on and now >= autoAt then
+					autoAt = now + 0.5
+					autoEval()
 				end
 
 				--  Panel: nur wenn sich wirklich etwas getan haben KANN.
 				--  panelHz ist die Obergrenze fuer den Fall, dass etwas
 				--  passiert; passiert nichts, laeuft es auf panelIdle.
 				local screen, n1, sendScreen = nil, 0, false
+				local pp0 = PROF.on and os.clock() or nil
 				local pulse   = panelPulse()
+				if pp0 then profMark(pp0, "panel.pulse (je Bild)") end
 				local changed = (pulse ~= lastPulse)
 				lastPulse = pulse
 
@@ -2013,16 +2765,103 @@ local function startLoop()
 				local busy = now < busyUntil
 				SP.busy = busy
 
-				local since   = now - panelAt
-				local due     = SP.dirty or changed
-					or since >= (1 / math.max(1, SP.rate.panelIdle))
+				--  NACH EINEM NEUAUFBAU NICHT NUR EINMAL NACHSCHAUEN.
+				--
+				--  SP.dirty erzwingt normalerweise genau EINEN sofortigen
+				--  serializeScreen()-Durchlauf, direkt im naechsten Bild nach
+				--  KB.togglePanelOpen()/applyLayout(). Bei frisch gebauten
+				--  Elementen (AutomaticSize, UIListLayout - siehe der
+				--  Kommentar in emit() oben zu "Kein Platz, aber Kinder
+				--  koennen trotzdem herausragen") hat Roblox zu diesem
+				--  Zeitpunkt oft noch gar nicht fertig layoutet; das Panel
+				--  steht schon im Baum, aber AbsolutePosition/AbsoluteSize
+				--  einzelner Kinder sind noch die von VOR dem Aufbau bzw.
+				--  Null. Genau DIESER halbfertige Stand wurde bisher als
+				--  einziger und damit als lastScreen verschickt - schliesst
+				--  man das Panel (H) BEVOR ein zweiter Durchlauf das
+				--  richtigstellt, bleibt der Rest bis zum naechsten echten
+				--  Anlass (oder dem Leerlauf-Takt, siehe panelIdle) stehen.
+				--  Gemeldet als "Panel nicht fertig aufgebaut, H erneut
+				--  gedrueckt -> Reste bleiben auf dem Overlay haengen".
+				--
+				--  Deshalb bleibt "due" nach jedem SP.dirty nicht nur fuer
+				--  einen, sondern fuer ein kurzes Fenster erzwungen - lange
+				--  genug, dass die nachtraeglich aufgeloeste Layout-Groesse
+				--  noch VOR einem schnellen zweiten H eingefangen und als
+				--  Korrektur verschickt wird, kurz genug, dass niemand eine
+				--  Verzoegerung beim Oeffnen bemerkt (es wird ja weiterhin
+				--  SOFORT der erste, bestmoegliche Stand verschickt - dieses
+				--  Fenster fuegt nur zusaetzliche, guenstige Nachkontrollen
+				--  hinzu, gebremst wie eh und schon durch panelHz/busy).
+				if SP.dirty then settleUntil = now + 0.15 end
+				local settling = now < settleUntil
 
-				if due and since >= (1 / panelHz) then
-					local t0 = os.clock()
-					screen, n1 = serializeScreen()
-					local cost = (os.clock() - t0) * 1000
-					panelAt, SP.dirty = now, false
+				--  DAS SICHERHEITSNETZ BREMST SICH SELBST AUS.
+				--
+				--  Der Leerlauf-Durchlauf (panelIdle) liest das GANZE Panel samt
+				--  Inventar-HUD - gemessen 1 bis 3,3 ms, zehn Mal je Sekunde -
+				--  nur um nachzusehen, ob sich etwas getan hat. Meist hat es das
+				--  nicht (das HUD aendert sich alle paar Sekunden). Auf einem
+				--  schwachen Rechner ist jeder dieser Durchlaeufe ein spuerbarer
+				--  Ruckler (Lows), zehn Mal je Sekunde.
+				--
+				--  Kam beim letzten Leerlauf-Durchlauf GENAU DASSELBE heraus,
+				--  wird der Abstand zum naechsten um die Haelfte laenger, bis
+				--  hoechstens eine halbe Sekunde. Aendert sich etwas - oder die
+				--  Maus steht ueber dem Panel (Tooltips erscheinen ohne
+				--  Mausbewegung) -, ist sofort wieder der volle Takt da. Ausser
+				--  dem Netz gibt es jetzt auch den Hinweis: SP.poke() vom
+				--  Hauptskript, sobald das HUD sich wirklich geaendert hat (siehe
+				--  DIV.invHudTick), loest den naechsten Durchlauf sofort aus.
+				local since    = now - panelAt
+				local idleBase = 1 / math.max(1, SP.rate.panelIdle)
+				if not idleGap or SP.overPanel then idleGap = idleBase end
+				local forced = SP.dirty or changed or settling or SP.poked
+				local due    = forced or since >= idleGap
+
+				--  Ein laufendes Scheibchen weiterfuehren - oder verwerfen, wenn
+				--  inzwischen etwas Eiliges vorliegt (erzwungene Durchlaeufe sind
+				--  immer am Stueck und sofort, siehe sliceBegin).
+				local passDone, cost = false, 0
+				if slice and forced then slice = nil end
+				if slice then
+					local st, res, cnt = sliceStep(slice, SLICE_BUDGET)
+					if st == "done" then
+						screen, n1, cost, passDone = res, cnt, slice.ms, true
+						slice = nil
+					elseif st == "error" then
+						slice = nil
+					end
+				elseif due and since >= (1 / panelHz) then
+					panelAt = now
+					if forced then
+						local t0 = os.clock()
+						screen, n1 = serializeScreen()
+						cost = (os.clock() - t0) * 1000
+						passDone = true
+						SP.dirty, SP.poked = false, false
+					elseif SP.sliceIdle == false then
+						--  Abschaltbar (SP.sliceIdle = false), falls je etwas
+						--  Unerwartetes auftaucht: dann wie vorher am Stueck.
+						local t0 = os.clock()
+						screen, n1 = serializeScreen()
+						cost = (os.clock() - t0) * 1000
+						passDone = true
+					else
+						slice = sliceBegin()
+						local st, res, cnt = sliceStep(slice, SLICE_BUDGET)
+						if st == "done" then
+							screen, n1, cost, passDone = res, cnt, slice.ms, true
+							slice = nil
+						elseif st == "error" then
+							slice = nil
+						end
+					end
+				end
+
+				if passDone then
 					SP.panelMs = cost
+					if PROF.on then profAdd("panel.serialize (je Durchlauf)", cost) end
 
 					--  Wieviele Durchlaeufe je Sekunde passen in das
 					--  Lastbudget? Gleitend nachgezogen, damit ein einzelner
@@ -2048,7 +2887,17 @@ local function startLoop()
 
 					if screen ~= lastScreen then
 						lastScreen, sendScreen = screen, true
+						idleGap = idleBase
+						SP.screenSeq = (SP.screenSeq or 0) + 1   -- Diagnose: wie oft hat sich das Panel wirklich geaendert
+					elseif forced or panelOffen() then
+						--  Auch bei OFFENEM Hauptpanel kein Abbremsen: dort laufen
+						--  lebende Werte, und wer das Panel offen hat, schaut hin.
+						idleGap = idleBase
+					else
+						--  Leerlauf-Durchlauf, nichts Neues: naechster spaeter.
+						idleGap = math.min(idleGap * 1.5, math.max(idleBase, 0.5))
 					end
+					SP.idleGap = idleGap
 					--  Getrennt merken: das Panel wird nur alle paar Bilder
 					--  abgelesen, die Tags bei jedem. Beides in eine Zahl zu
 					--  schreiben hiess, dass in der Statuszeile fast immer
@@ -2063,13 +2912,25 @@ local function startLoop()
 				--  denselben Inhalt traegt wie das letzte, kostet auf beiden
 				--  Seiten Arbeit und aendert kein Pixel.
 				if n2 == 0 and not sendScreen then return end
+				--  Ein Bild ohne neue Schild-Positionen UND ohne Panel-Aenderung
+				--  (gedrosselte Schild-Rate) hat nichts zu melden.
+				if not tagsFresh and not sendScreen then return end
 
+				local nt0 = PROF.on and os.clock() or nil
+				local sc0 = os.clock()   -- immer an: Auto braucht die Kosten des Sendens
 				local payload = frameText(sendScreen and screen or nil, tags, not sendScreen)
+				if nt0 then
+					nt0 = profMark(nt0, "net.frameText")
+					profAdd("net.payload KB", #payload / 1024)
+				end
 
 				if useWs and sock then
 					--  Direkt raus, ohne Sammelpuffer: das ist die Stelle,
 					--  an der die Echtzeit entsteht oder verloren geht.
 					sock:Send(payload)
+					if nt0 then profMark(nt0, "net.send") end
+					local sms = (os.clock() - sc0) * 1000
+					AUTO.sendEma = AUTO.sendEma and (AUTO.sendEma * 0.95 + sms * 0.05) or sms
 					sentCount += 1
 				else
 					--  Rueckfall ohne WebSocket. Eine request()-Runde kostet
@@ -2098,6 +2959,11 @@ local function startLoop()
 				end
 			end)
 
+			if lt0 then
+				profMark(lt0, "schleife.gesamt (Bruecke je Bild)")
+				PROF.frames += 1
+			end
+
 			if okAll then
 				fails = 0
 				frames += 1
@@ -2113,6 +2979,12 @@ local function startLoop()
 				end
 			else
 				fails += 1
+				--  Ein Fehler MITTEN in serializeTags/serializeScreen liess den
+				--  Waechter "busy" auf true stehen - danach lieferten beide
+				--  stumm "[]" zurueck, ohne je wieder einen Fehler zu melden
+				--  (Schilder und Panel weg, Bruecke scheinbar gesund). Jetzt
+				--  wird der Waechter mit dem Fehlschlag zurueckgesetzt.
+				busy = false
 				--  Drei Fehlschlaege hintereinander heissen: das Programm
 				--  ist weg. Dann wird zurueckgeschaltet, statt blind
 				--  weiterzusenden - sonst saesse man ohne jede Anzeige da
@@ -2164,6 +3036,22 @@ function SP.setActive(on, reason)
 		end
 
 		SP.active = true
+		--  EIGENES PROFIL SETZEN, NICHT AUF DIE APP WARTEN.
+		--
+		--  SP.rate (oben, Datei-Ebene) startet mit rohen Werten, die zu
+		--  KEINEM der drei Profile unten passen - insbesondere minPanel=8
+		--  statt der 240, die "normal" (siehe dort, der lange Kommentar
+		--  ueber SP.setProfile) ausdruecklich als "kein kostenbasierter
+		--  Deckel mehr" begruendet. Bisher wurde "normal" erst gesetzt,
+		--  wenn die App ihren "profile"-Befehl ueber die Leitung schickt -
+		--  bis dahin lief die Bruecke also entgegen ihrer eigenen
+		--  Dokumentation mit einem Panel, das ein Lastspitzchen bis auf
+		--  8 Hz herunterdrosseln durfte. Das eigene Profil hier zu setzen,
+		--  bevor startLoop() ueberhaupt den ersten Takt macht, braucht die
+		--  App dafuer nicht mehr - schickt sie spaeter trotzdem "profile",
+		--  gewinnt das wie gehabt (SP.setProfile ueberschreibt einfach
+		--  erneut).
+		SP.setProfile("normal")
 		collectExistingTags()
 		eachScreenGui(hideScreenGui)
 		enforceTags(true)
@@ -2187,6 +3075,7 @@ function SP.setActive(on, reason)
 	SP.active = false
 	SP.status = (SP.status == "lost") and "lost" or "off"
 	SP.fps, SP.prims, SP.panelPrims = 0, 0, 0
+	TAGC = {}   -- Schild-Inhalte nicht ueber das Abschalten hinaus festhalten
 
 	--  Die Verbindung SOFORT kappen, nicht erst wenn die Schleife das
 	--  naechste Mal drankommt. Solange sie steht, zeigt das Overlay das
@@ -2228,10 +3117,10 @@ function SP.toggle(reason) return SP.setActive(not SP.active, reason or "toggle"
 --  Kurzfassung fuer die Keybinds-Seite.
 function SP.label()
 	if SP.active then
-		return ("ON  ·  %d/%d sent  ·  %d prims  ·  panel %d Hz%s / %.1f ms  ·  %s")
+		return ("ON  ·  %d sent  ·  %d fps  ·  %d prims  ·  panel %d Hz%s / %.1f ms  ·  tags %.1f ms  ·  %s")
 			:format(SP.sent or 0, SP.fps or 0, SP.prims,
 				SP.hzNow or 0, SP.busy and " (aktiv)" or "",
-				SP.panelMs or 0,
+				SP.panelMs or 0, SP.tagMs or 0,
 				(SP.sock ~= nil) and "ws" or "HTTP (langsam!)")
 	end
 	if SP.status == "missing" then return "APP NOT FOUND  ·  link copied" end
@@ -2254,6 +3143,7 @@ function SP.debugFrame()
 			live       = true,
 			prims      = SP.prims,
 			panelMs    = SP.panelMs,
+			tagMs      = SP.tagMs,
 			panelHz    = SP.hzNow,
 			sendFps    = SP.fps,
 			transport  = SP.ws and "websocket" or "http",
@@ -2285,6 +3175,42 @@ function SP.shutdown()
 	if SP.active then pcall(SP.setActive, false, "shutdown (Skript entladen)") end
 	SP.active = false
 	SP.status = "off"
+end
+
+--  MISST, WOFUER DIE BRUECKE IHRE ZEIT BRAUCHT.
+--
+--  SP.messen(5) schaltet fuenf Sekunden lang die Phasenuhren ein (siehe
+--  PROF) und liefert je Phase: n (Messungen), mittel und p95/max in
+--  Millisekunden sowie jeBild (Summe / Durchlaeufe der Schleife - das ist
+--  der Anteil, den die Phase im Schnitt an JEDEM Bild hat, auch wenn sie
+--  nur gelegentlich laeuft, wie das Panel). "tags.anzahl sichtbar" und
+--  "net.payload KB" sind keine Zeiten, sondern Anzahl bzw. Kilobyte.
+--
+--  Blockiert nur den aufrufenden Faden (task.wait), nicht die Bruecke.
+--  Aendert nichts am Verhalten - ohne Aufruf bleibt PROF.on ausgeschaltet.
+function SP.messen(seconds)
+	seconds = math.clamp(tonumber(seconds) or 5, 1, 30)
+	if PROF.on then return { fehler = "laeuft bereits" } end
+	if not SP.active then return { fehler = "Bruecke ist aus - nichts zu messen" } end
+	PROF.t, PROF.frames = {}, 0
+	PROF.on = true
+	task.wait(seconds)
+	PROF.on = false
+
+	local function r(x) return math.floor(x * 1000 + 0.5) / 1000 end
+	local out = { sekunden = seconds, durchlaeufe = PROF.frames, phasen = {} }
+	for name, p in pairs(PROF.t) do
+		local s = table.clone(p.s)
+		table.sort(s)
+		out.phasen[name] = {
+			n      = p.n,
+			mittel = r(p.sum / p.n),
+			p95    = r(s[math.max(1, math.floor(#s * 0.95))] or 0),
+			max    = r(p.max),
+			jeBild = PROF.frames > 0 and r(p.sum / PROF.frames) or 0,
+		}
+	end
+	return out
 end
 
 print(("[Streamproof] Bruecke bereit (v%s). SP.toggle() oder die Taste im KEYBINDS-Tab.")
