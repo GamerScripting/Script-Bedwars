@@ -76,7 +76,7 @@ end
 --------------------------------------------------------------------
 -- Konfiguration
 --------------------------------------------------------------------
-SP.VERSION  = "2.0"
+SP.VERSION  = "2.1"
 SP.PORT     = 7373
 SP.BASE     = "http://127.0.0.1:7373"
 SP.WSURL    = "ws://127.0.0.1:7373/ws"
@@ -196,6 +196,10 @@ SP.rate = {
 	maxLoadIdle = 0.01, -- wenn nichts passiert
 	busyFor     = 0.4,  -- Sekunden, die eine Eingabe als "busy" gilt
 	minPanel    = 8,    -- so weit darf heruntergeregelt werden
+	--  Hz fuer Durchlaeufe, die NUR eine Mausbewegung ueber dem Panel
+	--  ausgeloest hat (siehe HOVER_HZ in startLoop) - Ziehen, Scrollen und
+	--  Neuaufbau sind davon nicht betroffen.
+	hoverHz     = 60,
 }
 
 --  Von aussen setzbar, damit die App die Werte fernsteuern kann.
@@ -260,8 +264,8 @@ function SP.setAuto(on)
 	AUTO.on, AUTO.cur, AUTO.want, AUTO.votes = on, 1, 1, 0
 	if on then
 		SP.rate.tags     = AUTO_LADDER[1]
-		SP.rate.panel    = 240
-		SP.rate.minPanel = 30
+		SP.rate.panel    = 120    -- feste Panel-Rate, siehe SP.setProfile
+		SP.rate.minPanel = 120
 	end
 end
 
@@ -273,6 +277,13 @@ end
 --  richtig; auf einem Notebook, das im Spiel schon bei 45 Bildern haengt,
 --  ist jede Millisekunde, die dieses Modul nimmt, eine, die das Spiel
 --  verliert. Darum drei Stufen statt einer Vermutung.
+--  FESTE PANEL-RATE (seit 2026-10-30): r.panel ist jetzt die EINE Rate, mit
+--  der das Panel gelesen wird, sobald es offen ist oder sich etwas tut - kein
+--  kostenbasierter Regler mehr, kein Sprung auf 240 Hz beim Scrollen/Ziehen/
+--  Hovern. Genau diese Spruenge (fast nichts -> 240 volle Durchlaeufe je
+--  Sekunde zu je 1,6-3 ms) waren die gemeldeten FPS-Einbrueche. Die langen
+--  Kommentare unten zu minPanel/maxLoadBusy beschreiben den alten, variablen
+--  Weg; minPanel und maxLoad* werden von startLoop nicht mehr benutzt.
 function SP.setProfile(name)
 	local r = SP.rate
 	--  Das Profil ist die Grundlage: es ueberschreibt alle Raten unten, also
@@ -280,13 +291,15 @@ function SP.setProfile(name)
 	--  (die App tut das in dieser Reihenfolge).
 	SP.auto, AUTO.on = false, false
 	if name == "spar" then
-		r.tags, r.panel, r.panelIdle       = 60,  40,  4
+		r.tags, r.panel, r.panelIdle       = 60,  30,  4
 		r.maxLoadBusy, r.maxLoadIdle       = 0.03, 0.005
 		r.busyFor, r.minPanel              = 0.5, 4
+		r.hoverHz                          = 30
 	elseif name == "max" then
 		r.tags, r.panel, r.panelIdle       = 0,   240, 20
 		r.maxLoadBusy, r.maxLoadIdle       = 0.15, 0.03
 		r.busyFor, r.minPanel              = 0.35, 10
+		r.hoverHz                          = 120
 	else -- "normal"
 		--  maxLoadBusy war 0.08 (acht Prozent). Bei einem Panel mit vielen
 		--  Zeilen - Team-Liste, Kit-Icons, Schloss- und Rang-Abzeichen je
@@ -355,9 +368,10 @@ function SP.setProfile(name)
 		--  Welt-Tags (r.tags) stehen bereits auf 0 - "jeder gerenderte
 		--  Frame", also schon schneller als jede feste Zahl es waere; fuer
 		--  sie gibt es hier nichts anzuheben, sie sind bereits unbegrenzt.
-		r.tags, r.panel, r.panelIdle       = 0,   240, 10
+		r.tags, r.panel, r.panelIdle       = 0,   120, 10
 		r.maxLoadBusy, r.maxLoadIdle       = 0.12, 0.01
 		r.busyFor, r.minPanel              = 0.4, 240
+		r.hoverHz                          = 60
 	end
 	r.minPanelBase = r.minPanel   -- Grundlage fuer SP.setRate, siehe dort
 	SP.profile = name or "normal"
@@ -383,6 +397,16 @@ end
 --  mitbringt, weil hier nichts neu gebaut wurde, nur Inhalt getauscht.
 function SP.poke()
 	SP.poked = true
+end
+
+--  Eine im Kit-Panel (STREAMPROOF ⚙) geaenderte Einstellung an die App.
+--  Nur die geaenderten Felder: { mode = "manual" } oder { panelHz = 90 } ...
+--  Die App speichert, zieht ihr Fenster nach und schickt den neuen Stand
+--  an ALLE Skripte zurueck (cmd "cfg", siehe SP.appCfg).
+function SP.sendCfg(t)
+	local s = SP.sock
+	if not s or type(t) ~= "table" then return false end
+	return (pcall(function() s:Send(HttpService:JSONEncode({ cfg = t })) end))
 end
 
 --  Registry aller BillboardGuis, die das Hauptskript erzeugt hat. Gefuellt
@@ -2490,9 +2514,13 @@ local function panelPulse()
 		end
 	end
 
-	--  Maus nur beachten, wenn sie ueber dem Panel steht.
+	--  Maus nur beachten, wenn sie ueber dem Panel steht. GETRENNT
+	--  zurueckgegeben (zweiter Wert): Scrollen ist eine sichtbare Aenderung,
+	--  die sofort raus muss - eine blosse Mausbewegung meist nicht, siehe
+	--  HOVER_HZ in der Hauptschleife.
+	local mp = 0
 	if #hotRects > 0 then
-		local ok, m = pcall(function() return UserInputService:GetMouseLocation() end)
+		local ok, m = pcall(UserInputService.GetMouseLocation, UserInputService)
 		if ok and m then
 			local drueber = false
 			for i = #hotRects, 1, -1 do
@@ -2508,12 +2536,12 @@ local function panelPulse()
 				end
 			end
 			SP.overPanel = drueber
-			if drueber then n += m.X * 31 + m.Y * 37 end
+			if drueber then mp = m.X * 31 + m.Y * 37 + 1 end
 		end
 	else
 		SP.overPanel = false
 	end
-	return n
+	return n, mp
 end
 
 --------------------------------------------------------------------
@@ -2582,6 +2610,7 @@ local function startLoop()
 		local SLICE_BUDGET = 0.0005
 		local tagAt = 0
 		local lastPulse = nil
+		local lastMouse, hoverAt = 0, 0   -- siehe HOVER_HZ unten
 		local busyUntil = 0
 		--  Siehe "settling" weiter unten: bis zu diesem Zeitpunkt bleibt
 		--  "due" nach einem SP.touch() erzwungen, nicht nur fuer EINEN
@@ -2591,6 +2620,7 @@ local function startLoop()
 		local sentCount = 0
 		local fails = 0
 		local panelHz = SP.rate.panel
+		local pendingPanel = false   -- Aenderung gesehen, Durchlauf steht noch aus (feste Rate)
 
 		--  Verbindung aufbauen - und zwar so, dass sie sich auch wieder
 		--  aufbaut.
@@ -2664,6 +2694,15 @@ local function startLoop()
 					elseif cmd.cmd == "profile" then
 						SP.setProfile(tostring(cmd.name))
 						print("[Streamproof] Leistungsstufe: " .. tostring(SP.profile))
+					elseif cmd.cmd == "cfg" then
+						--  Der Raten-Stand der App fuers Kit-Panel (STREAMPROOF ⚙):
+						--  Modus, Regler, und was ausserhalb von "Manuell" gilt.
+						--  Das Kit setzt SP.onAppCfg, um die Karte nachzuziehen.
+						SP.appCfg = cmd
+						local h = SP.onAppCfg
+						if type(h) == "function" then
+							task.defer(function() pcall(h, cmd) end)
+						end
 					elseif cmd.cmd == "ping" then
 						pcall(function()
 							s:Send('{"v":1,"pong":1}')
@@ -2749,10 +2788,29 @@ local function startLoop()
 				--  passiert; passiert nichts, laeuft es auf panelIdle.
 				local screen, n1, sendScreen = nil, 0, false
 				local pp0 = PROF.on and os.clock() or nil
-				local pulse   = panelPulse()
+				local pulse, mpulse = panelPulse()
 				if pp0 then profMark(pp0, "panel.pulse (je Bild)") end
-				local changed = (pulse ~= lastPulse)
+				local scrolled = (pulse ~= lastPulse)
 				lastPulse = pulse
+				local changed = scrolled
+
+				--  MAUS UEBER DEM PANEL: HOECHSTENS HOVER_HZ DURCHLAEUFE.
+				--
+				--  Jede Mausbewegung ueber Panel oder Inventar-HUD hat bisher
+				--  einen vollen Panel-Durchlauf erzwungen - in jedem Bild, also
+				--  bis zu 240 Mal je Sekunde, bei gemessen ~1,6 ms je Durchlauf
+				--  gut ein Drittel des Render-Threads, solange man die Maus dort
+				--  bewegt (z. B. beim Einkaufen ueber dem HUD). Sichtbar aendert
+				--  sich dabei aber nur etwas, wenn die Maus eine Grenze ueberquert
+				--  (Hervorhebung, Tooltip - beide haengen an ihrer Pille, nicht
+				--  an der Maus). Darum hier gedrosselt; die letzte Position geht
+				--  trotzdem nie verloren (lastMouse bleibt stehen, bis ein
+				--  Durchlauf sie mitnimmt). Ziehen (SP.dirty), Scrollen,
+				--  Neuaufbau (SP.touch) und SP.poke bleiben ungedrosselt.
+				local hovered = (mpulse ~= lastMouse)
+				if hovered and now - hoverAt >= 1 / math.max(1, SP.rate.hoverHz or 60) then
+					changed, hoverAt, lastMouse = true, now, mpulse
+				end
 
 				--  BEDIENST DU GERADE ETWAS?
 				--
@@ -2761,7 +2819,7 @@ local function startLoop()
 				--  gescrollt. Genau daran wird "busy" erkannt - und ein paar
 				--  Zehntel nachgehalten, damit die Rate nicht bei jeder
 				--  Pause zwischen zwei Mausbewegungen einbricht.
-				if changed or SP.dirty then busyUntil = now + SP.rate.busyFor end
+				if changed or hovered or SP.dirty then busyUntil = now + SP.rate.busyFor end
 				local busy = now < busyUntil
 				SP.busy = busy
 
@@ -2816,7 +2874,18 @@ local function startLoop()
 				local since    = now - panelAt
 				local idleBase = 1 / math.max(1, SP.rate.panelIdle)
 				if not idleGap or SP.overPanel then idleGap = idleBase end
-				local forced = SP.dirty or changed or settling or SP.poked
+
+				--  FESTE RATE (siehe SP.setProfile): hoechstens panelHz
+				--  Durchlaeufe je Sekunde, egal wie viel sich tut. Eine
+				--  Aenderung zwischen zwei Takten geht dabei nicht verloren -
+				--  sie wird vorgemerkt (pendingPanel) und im naechsten Takt
+				--  mitgenommen. Tut sich NICHTS, bleibt es beim ruhigen
+				--  Leerlauf-Takt (idleGap, scheibchenweise) - die feste Rate
+				--  auch im Stillstand wuerde bei offenem Panel dauerhaft ~12 %
+				--  des Render-Threads kosten, ohne dass sich etwas aendert.
+				panelHz = math.max(1, SP.rate.panel)
+				if changed then pendingPanel = true end
+				local forced = SP.dirty or pendingPanel or settling or SP.poked
 				local due    = forced or since >= idleGap
 
 				--  Ein laufendes Scheibchen weiterfuehren - oder verwerfen, wenn
@@ -2832,14 +2901,19 @@ local function startLoop()
 					elseif st == "error" then
 						slice = nil
 					end
-				elseif due and since >= (1 / panelHz) then
+				--  HALBES BILD TOLERANZ wie bei den Schildern (tagStep): bei 240 fps
+				--  und 120 Hz sollen es GENAU zwei Bilder sein. Ohne die Toleranz lagen
+				--  zwei Bilder durch kleinstes Zittern oft knapp unter 8,33 ms, und es
+				--  wurde ein drittes abgewartet - der Takt sprang 2-3-2-2-3, sichtbar als
+				--  Zittern des Panels.
+				elseif due and since >= (1 / panelHz) - frameDt * 0.5 then
 					panelAt = now
 					if forced then
 						local t0 = os.clock()
 						screen, n1 = serializeScreen()
 						cost = (os.clock() - t0) * 1000
 						passDone = true
-						SP.dirty, SP.poked = false, false
+						SP.dirty, SP.poked, pendingPanel = false, false, false
 					elseif SP.sliceIdle == false then
 						--  Abschaltbar (SP.sliceIdle = false), falls je etwas
 						--  Unerwartetes auftaucht: dann wie vorher am Stueck.
@@ -2871,19 +2945,9 @@ local function startLoop()
 					--  bedienst (siehe SP.rate.maxLoadBusy/Idle). Beim Ziehen
 					--  darf das Panel also das Siebenfache kosten - und
 					--  genau dann ist es das auch wert.
-					local budget = busy and SP.rate.maxLoadBusy or SP.rate.maxLoadIdle
-					local erlaubt = SP.rate.panel
-					if cost > 0.05 then
-						erlaubt = math.clamp(
-							(budget * 1000) / cost,
-							SP.rate.minPanel, SP.rate.panel)
-					end
-					--  Hoch schnell, runter langsam: wenn du anfaengst zu
-					--  ziehen, soll das Panel sofort mitkommen; laesst du los,
-					--  darf es sich Zeit nehmen. Mit einem einzigen
-					--  Glaettungsfaktor waere der erste Zug immer zaeh.
-					local k = (erlaubt > panelHz) and 0.6 or 0.15
-					panelHz = panelHz + (erlaubt - panelHz) * k
+					--  (Hier stand der kostenbasierte Regler, der panelHz je
+					--  nach Last zwischen minPanel und panel schob - die
+					--  "variable Frequenz". Ersetzt durch die feste Rate oben.)
 
 					if screen ~= lastScreen then
 						lastScreen, sendScreen = screen, true
@@ -3119,7 +3183,11 @@ function SP.label()
 	if SP.active then
 		return ("ON  ·  %d sent  ·  %d fps  ·  %d prims  ·  panel %d Hz%s / %.1f ms  ·  tags %.1f ms  ·  %s")
 			:format(SP.sent or 0, SP.fps or 0, SP.prims,
-				SP.hzNow or 0, SP.busy and " (aktiv)" or "",
+				--  Die GELTENDE feste Rate, nicht SP.hzNow: das zieht die Schleife
+				--  erst im naechsten Bild nach - wurde die Zeile genau dazwischen
+				--  gebaut (Profil schon gesetzt, Manuell-Rate noch nicht), stand
+				--  dort "120 Hz" bei laengst geltenden 240 und blieb so stehen.
+				math.floor((SP.rate and SP.rate.panel) or SP.hzNow or 0), SP.busy and " (aktiv)" or "",
 				SP.panelMs or 0, SP.tagMs or 0,
 				(SP.sock ~= nil) and "ws" or "HTTP (langsam!)")
 	end
