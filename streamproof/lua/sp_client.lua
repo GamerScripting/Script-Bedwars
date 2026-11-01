@@ -76,7 +76,7 @@ end
 --------------------------------------------------------------------
 -- Konfiguration
 --------------------------------------------------------------------
-SP.VERSION  = "2.1"
+SP.VERSION  = "2.2"
 SP.PORT     = 7373
 SP.BASE     = "http://127.0.0.1:7373"
 SP.WSURL    = "ws://127.0.0.1:7373/ws"
@@ -524,6 +524,12 @@ local held = {}
 local TAGC = {}
 local FADE_STEPS = 32
 
+--  Lage und Breite der sichtbaren "Pill" je Schild, relativ zur Box - fuer die
+--  seitliche Randregel in serializeTags. Alle 0,25 s frisch gelesen (die Breite
+--  aendert sich nur mit dem Text), sonst waeren es drei Engine-Aufrufe je
+--  Schild und Bild. Aufgeraeumt wie TAGC.
+local PILLX = {}
+
 --  WIE LANGE EIN INHALT GILT, HAENGT AN DER BILDRATE.
 --
 --  Fuenf Bilder, aber nie kuerzer als 1/30 s und nie laenger als 1/12 s. Bei
@@ -880,6 +886,7 @@ local function enforceTags(on)
 			held[gui] = nil
 			tagIds[gui] = nil
 			TAGC[gui] = nil
+			PILLX[gui] = nil
 		elseif on then
 			SP.hideTag(gui)
 		end
@@ -1142,6 +1149,242 @@ local function fadeT(t, fade)
 	return t + (1 - t) * fade
 end
 
+--  3D-SZENEN (ViewportFrame) ------------------------------------------------
+--
+--  Roblox rendert ein ViewportFrame selbst, das fertige Bild ist aus Lua nicht
+--  zu holen. Bisher stand an der Stelle eine graue Flaeche. Jetzt geht die
+--  GEOMETRIE an die App (Quader mit Farbe, Transparenz und Texturen, einmal
+--  und nur wenn sie sich aendert, als eigene Nachricht {"scene":...}), und im
+--  Bild steht nur die Kamera ("k":"3" mit Verweis "sid"). Gezeichnet wird in
+--  der App (Scene3D.cs) - Orbit, Zoom und Umschalten der Schichten laufen
+--  also ueber dasselbe wie im Spiel: die Kamera des ViewportFrames.
+--
+--  Meshes (MeshPart, Union) erscheinen als ihr Umriss-Quader: ihre Dreiecke
+--  sind nicht lesbar.
+--
+--  ALLES IN EINER TABELLE: das Hauptstueck hat ein hartes Limit fuer lokale
+--  Variablen (der Executor ein strengeres als luau-compile), eine einzige
+--  Variable fuer das ganze Thema schont es.
+local SC3 = {
+	st = {},          -- ViewportFrame -> { id, body, msg, dirty, seenAt, sentAt, c1, c2 }
+	q = {}, nq = 0,   -- neue/geaenderte Nachrichten, die vor dem naechsten Bild rausgehen
+	out = {},         -- Arbeitsfeld fuer collect()
+	cb = {},          -- Arbeitsfeld fuer die 13 Kamerazahlen
+	seq = 0,
+	lastSig = nil,
+	MAXPARTS = 1500,
+	MAXHZ = 90,
+	camDirty = false, camAt = 0,
+	FACE = {
+		[Enum.NormalId.Right] = 0, [Enum.NormalId.Top] = 1, [Enum.NormalId.Back] = 2,
+		[Enum.NormalId.Left] = 3, [Enum.NormalId.Bottom] = 4, [Enum.NormalId.Front] = 5,
+	},
+	isBase = {},
+}
+
+--  Kompakte Zahl mit vier Nachkommastellen (num() oben rundet auf zwei -
+--  fuer Drehmatrizen zu grob).
+function SC3.num(v)
+	if v == 0 or v ~= v or v == math.huge or v == -math.huge then return "0" end
+	local t = ("%.4f"):format(v):gsub("0+$", ""):gsub("%.$", "")
+	return t
+end
+
+--  Die ganze Geometrie als Textstueck (ohne id). Teuer (jedes Teil mehrere
+--  Lesezugriffe) - darum nur, wenn sich im ViewportFrame etwas geaendert hat.
+function SC3.body(vp)
+	local fmt = SC3.num
+	local parts, n = {}, 0
+	local desc = vp:GetDescendants()
+	for i = 1, #desc do
+		local d = desc[i]
+		local cls = d.ClassName
+		local isb = SC3.isBase[cls]
+		if isb == nil then
+			isb = d:IsA("BasePart")
+			SC3.isBase[cls] = isb
+		end
+		if isb and n < SC3.MAXPARTS and d.Transparency < 0.98 then
+			local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = d.CFrame:GetComponents()
+			local sz = d.Size
+			local tex, tn = nil, 0
+			local kids = d:GetChildren()
+			for j = 1, #kids do
+				local ch = kids[j]
+				local cc = ch.ClassName
+				if cc == "Texture" or cc == "Decal" then
+					local img, face = ch.Texture, SC3.FACE[ch.Face]
+					if img ~= "" and face then
+						tn += 1
+						tex = tex or {}
+						tex[tn] = ('[%d,%s,"%s",%s]'):format(face, jstr(img), hex(ch.Color3), fmt(ch.Transparency))
+					end
+				end
+			end
+			n += 1
+			parts[n] = ('[%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s",%s,%d%s]'):format(
+				fmt(x), fmt(y), fmt(z),
+				fmt(r00), fmt(r01), fmt(r02), fmt(r10), fmt(r11), fmt(r12), fmt(r20), fmt(r21), fmt(r22),
+				fmt(sz.X), fmt(sz.Y), fmt(sz.Z),
+				hex(d.Color), fmt(d.Transparency),
+				(d.Material == Enum.Material.Neon) and 1 or 0,
+				tex and (",[" .. table.concat(tex, ",") .. "]") or "")
+		end
+	end
+	local ld = vp.LightDirection
+	return ('"amb":"%s","lc":"%s","ld":[%s,%s,%s],"p":[%s]'):format(
+		hex(vp.Ambient), hex(vp.LightColor), fmt(ld.X), fmt(ld.Y), fmt(ld.Z), table.concat(parts, ","))
+end
+
+--  Kann die laufende App 3D-Szenen (ab 2.2)? Eine aeltere verstuende die
+--  Nachricht {"scene":...} als leeres Bild (die Schilder waeren kurz weg) und den
+--  Befehl "3" als Ende eines Clips. Die Bruecke wird ueber das CDN sofort fuer
+--  alle aktualisiert, die App aber erst auf Klick - also bleibt es bei einer
+--  aelteren App bei der grauen Flaeche. SP.appVer kommt aus dem Ping.
+function SC3.appOk()
+	local v = tostring(SP.appVer or "")
+	if v ~= SC3.verSeen then
+		SC3.verSeen = v
+		local a, b = v:match("^(%d+)%.(%d+)")
+		a, b = tonumber(a), tonumber(b)
+		SC3.verOk = a ~= nil and (a > 2 or (a == 2 and b >= 2))
+	end
+	return SC3.verOk
+end
+
+--  Aus emit(): die Stelle eines ViewportFrames. Gibt false zurueck, wenn es
+--  (noch) nichts zu zeigen gibt - dann setzt der Aufrufer die graue Flaeche.
+function SC3.emit(vp, x, y, w, h, fade)
+	if not SC3.appOk() then return false end
+	local cam = vp.CurrentCamera
+	if not cam then return false end
+	local now = os.clock()
+	local st = SC3.st[vp]
+	if not st then
+		st = { dirty = true }
+		SC3.st[vp] = st
+		--  Jede Aenderung im Inneren (Teil dazu, Teil weg, Textur dazu) merkt nur
+		--  vor; gelesen wird beim naechsten Durchlauf, und nur dann geschickt,
+		--  wenn wirklich etwas anders ist. Das Kit baut den Viewport neu auf
+		--  (ClearAllChildren), statt Teile zu verstellen.
+		st.c1 = vp.DescendantAdded:Connect(function() st.dirty = true end)
+		st.c2 = vp.DescendantRemoving:Connect(function() st.dirty = true end)
+	end
+	st.seenAt = now
+	if st.dirty then
+		st.dirty = false
+		local ok, body = pcall(SC3.body, vp)
+		if ok and body and body ~= st.body then
+			SC3.seq += 1
+			st.id, st.body = SC3.seq, body
+			st.msg = '{"scene":{"id":' .. st.id .. ',' .. body .. '}}'
+			SC3.nq += 1
+			SC3.q[SC3.nq] = st.msg
+			st.sentAt = now
+		end
+	end
+	if not st.id then return false end
+
+	--  KEINE Kamera im Befehl: sie aendert sich bei jedem Drehen, das Panel aber
+	--  nicht. Sie geht als eigenes Feld ans Paketende (SC3.camsText), sodass ein
+	--  Kamerawechsel das Panel nicht neu lesen muss - gemessen kostete das
+	--  im BED-Tab ~4 ms je Kamerabild (490 Befehle).
+	put(('{"k":"3","x":%s,"y":%s,"w":%s,"h":%s,"sid":%d%s}'):format(
+		num(x), num(y), num(w), num(h), st.id,
+		(fade and fade > 0) and (',"a":' .. num(fadeT(0, fade))) or ""))
+	return true
+end
+
+--  Die Kameras aller sichtbaren Szenen als Paketfeld: "cams":{"<sid>":[13 Zahlen]}
+--  (Position, Drehmatrix zeilenweise, Sichtfeld). nil, wenn es keine gibt.
+function SC3.camsText()
+	local fmt, cb = SC3.num, SC3.cb
+	local now, n, parts = os.clock(), 0, nil
+	for vp, st in pairs(SC3.st) do
+		if st.id and n < 4 and now - (st.seenAt or 0) < 1.0 then
+			local cam = vp.CurrentCamera
+			if cam then
+				local px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cam.CFrame:GetComponents()
+				cb[1], cb[2], cb[3] = fmt(px), fmt(py), fmt(pz)
+				cb[4], cb[5], cb[6] = fmt(r00), fmt(r01), fmt(r02)
+				cb[7], cb[8], cb[9] = fmt(r10), fmt(r11), fmt(r12)
+				cb[10], cb[11], cb[12] = fmt(r20), fmt(r21), fmt(r22)
+				cb[13] = fmt(cam.FieldOfView)
+				n += 1
+				parts = parts or {}
+				parts[n] = ('"%d":[%s]'):format(st.id, table.concat(cb, ","))
+			end
+		end
+	end
+	if not parts then return nil end
+	return '"cams":{' .. table.concat(parts, ",") .. "}"
+end
+
+--  Hat sich die Kamera eines sichtbaren Viewports bewegt? Die Kamera ist
+--  kein GUI-Element - ohne diese Frage meldet sich das Panel beim Drehen des
+--  Renders nicht, bis die Maus eine andere Grenze ueberquert.
+function SC3.camChanged()
+	if next(SC3.st) == nil then return false end
+	local sig, now = 0, os.clock()
+	--  HOECHSTENS MAXHZ MAL JE SEKUNDE. Jeder Kamerstand kostet die App eine
+	--  Rasterung (einige ms); bei 240 fps waeren das 240 je Sekunde. 90 reichen
+	--  fuer ein flaeissiges Drehen, und der LETZTE Stand geht nicht verloren:
+	--  lastSig bleibt stehen, bis ein Stand wirklich rausging.
+	if now - (SC3.camAt or 0) < 1 / SC3.MAXHZ then return false end
+	for vp, st in pairs(SC3.st) do
+		if now - (st.seenAt or 0) < 1.0 then
+			local cam = vp.CurrentCamera
+			if cam then
+				local cf = cam.CFrame
+				local p, l = cf.Position, cf.LookVector
+				sig += p.X * 1.3 + p.Y * 2.7 + p.Z * 3.9 + l.X * 17.1 + l.Y * 23.3 + l.Z * 31.7 + cam.FieldOfView * 0.37
+			end
+		end
+	end
+	if sig ~= SC3.lastSig then
+		SC3.lastSig, SC3.camAt, SC3.camDirty = sig, now, true
+		return true
+	end
+	return false
+end
+
+--  Vor dem Bild: neue Nachrichten, dazu alle paar Sekunden jede sichtbare
+--  Szene noch einmal (App neu gestartet, Nachricht verloren). Gibt die Anzahl
+--  zurueck; die Texte stehen in SC3.out[1..n].
+function SC3.collect()
+	if SC3.nq == 0 and next(SC3.st) == nil then return 0 end
+	local out, n, now = SC3.out, 0, os.clock()
+	for i = 1, SC3.nq do
+		n += 1
+		out[n] = SC3.q[i]
+		SC3.q[i] = nil
+	end
+	SC3.nq = 0
+	if n > 0 then SC3.camDirty = true end
+	for vp, st in pairs(SC3.st) do
+		local seen = now - (st.seenAt or 0)
+		if seen > 15 or vp.Parent == nil then
+			pcall(function() st.c1:Disconnect() end)
+			pcall(function() st.c2:Disconnect() end)
+			SC3.st[vp] = nil
+		elseif st.msg and seen < 5 and now - (st.sentAt or 0) >= 4 then
+			st.sentAt = now
+			n += 1
+			out[n] = st.msg
+			SC3.camDirty = true
+		end
+	end
+	return n
+end
+
+function SC3.reset()
+	for _, st in pairs(SC3.st) do
+		pcall(function() st.c1:Disconnect() end)
+		pcall(function() st.c2:Disconnect() end)
+	end
+	SC3.st, SC3.q, SC3.nq, SC3.lastSig = {}, {}, 0, nil
+end
+
 --  Ein einzelner GuiObject. ox/oy verschieben den ganzen Baum: bei einer
 --  ScreenGui ist das der GUI-Inset (AbsolutePosition zaehlt ab UNTERHALB
 --  der Topbar, das Fenster des Overlays faengt aber oben an), bei einem
@@ -1272,13 +1515,15 @@ local function emit(inst, ox, oy, fade, known)
 		end
 	end
 
-	--  ViewportFrame kann nicht gespiegelt werden - darin steckt ein
-	--  3D-Modell, und das rendert Roblox selbst. Statt es zu faelschen
-	--  bekommt die Stelle einen Platzhalter; betroffen ist allein das
-	--  Mech-Renderbild der Stufe 1, alles andere sind echte 2D-Bilder.
+	--  ViewportFrame: das fertige 3D-Bild ist aus Lua nicht zu holen. Die
+	--  Geometrie geht stattdessen an die App, die sie selbst zeichnet (siehe
+	--  SC3 oben). Der graue Platzhalter bleibt nur fuer den Fall, dass es noch
+	--  keine Kamera oder keine lesbare Geometrie gibt.
 	if cls == "ViewportFrame" and w > 0 and h > 0 then
-		put(('{"k":"r","x":%s,"y":%s,"w":%s,"h":%s,"c":"3C4252","a":%s,"r":%s}')
-			:format(num(x), num(y), num(w), num(h), num(fadeT(0.35, fade)), num(rad)))
+		if not SC3.emit(inst, x, y, w, h, fade) then
+			put(('{"k":"r","x":%s,"y":%s,"w":%s,"h":%s,"c":"3C4252","a":%s,"r":%s}')
+				:format(num(x), num(y), num(w), num(h), num(fadeT(0.35, fade)), num(rad)))
+		end
 	end
 
 	--  Kinder. ZIndexBehavior ist im Hauptskript "Sibling": Geschwister
@@ -1333,7 +1578,31 @@ local function emit(inst, ox, oy, fade, known)
 	if clip then
 		put(('{"k":"c","x":%s,"y":%s,"w":%s,"h":%s}'):format(num(x), num(y), num(w), num(h)))
 	end
-	for i = 1, nk do emit(kids[i], ox, oy, fade, true) end
+	--  ZEILEN AUSSERHALB DES SICHTBAREN TEILS EINER SCROLL-LISTE UEBERSPRINGEN.
+	--
+	--  Eine ScrollingFrame schneidet alles ausserhalb ihres Fensters ab - die
+	--  Zeilen dort sind unsichtbar, wurden aber bisher trotzdem komplett
+	--  gelesen, verschickt und in der App auf Kacheln verteilt. Beim Scrollen
+	--  (jeder Schritt = ein voller Durchlauf) war das bei langen Seiten wie
+	--  KEYBINDS der groesste Teil der Arbeit fuer nichts. Nur die DIREKTEN
+	--  Kinder (die Zeilen) werden geprueft - zwei Eigenschaften statt eines
+	--  ganzen Unterbaums -, und nur, wenn ihre Box wirklich Flaeche hat und
+	--  ganz draussen liegt; ein kollabiertes Element (0x0) bleibt wie bisher.
+	local sx0, sy0, sx1, sy1
+	if cls == "ScrollingFrame" and w > 0 and h > 0 then
+		sx0, sy0, sx1, sy1 = ap.X - 1, ap.Y - 1, ap.X + w + 1, ap.Y + h + 1
+	end
+	for i = 1, nk do
+		local ch = kids[i]
+		if sx0 then
+			local cp, cs = ch.AbsolutePosition, ch.AbsoluteSize
+			if cs.X > 0 and cs.Y > 0
+				and (cp.X > sx1 or cp.Y > sy1 or cp.X + cs.X < sx0 or cp.Y + cs.Y < sy0) then
+				continue
+			end
+		end
+		emit(ch, ox, oy, fade, true)
+	end
 	if clip then put('{"k":"e"}') end
 
 	--  Scrollbalken. Roblox zeichnet ihn selbst und er taucht im Baum nicht
@@ -1870,7 +2139,8 @@ local function serializeTags(raw)
 	--  EINMAL je Bild die Kamera vorausrechnen, danach ALLE Schilder damit
 	--  projizieren. Genau daran haengt, dass sie sich gemeinsam und starr
 	--  gegen die Kamera bewegen statt jedes fuer sich zu zappeln.
-	local camPred = predictCam(cam, os.clock())
+	local tNow    = os.clock()
+	local camPred = predictCam(cam, tNow)
 	local fov     = cam.FieldOfView
 	local vpx, vpy = cam.ViewportSize.X, cam.ViewportSize.Y
 
@@ -1909,6 +2179,7 @@ local function serializeTags(raw)
 			SP.tags[gui] = nil
 			SP.want[gui] = nil
 			TAGC[gui] = nil
+			PILLX[gui] = nil
 		elseif SP.want[gui] == false then
 			nWant += 1
 			--  Ausgefiltert: das Schild steht noch da, das Hauptskript will
@@ -2125,7 +2396,44 @@ local function serializeTags(raw)
 						--  Pruefung hier entscheidet nur, ob ueberhaupt ein
 						--  C#-Fenster fuer dieses Schild angelegt wird, nicht
 						--  mehr, ob dabei etwas ueberstehen darf.
-						local sichtbar = rawX + bw >= 0 and rawX >= -TAG_PUFFER_X and rawX <= vpx
+						--  SEITLICH: GANZ IM BILD ODER GAR NICHT.
+						--
+						--  Gewuenscht: kein Schild halb abgeschnitten am linken/
+						--  rechten Rand - sobald es seitlich aus dem Bild ginge,
+						--  soll es verschwinden. Erst stand hier die Box-Regel
+						--  (Schild blieb halb am Rand stehen, obwohl das Objekt
+						--  schon draussen war), dann die Anker-Regel (das Objekt
+						--  noch im Bild, das Schild aber ueber den Rand
+						--  hinaus abgeschnitten) - beides so gemeldet. Gemessen
+						--  wird am sichtbaren Inhalt (der "Pill"), nicht an der
+						--  viel groesseren, leeren Box, sonst verschwaende es zu
+						--  frueh. Oben/unten bleibt die Box-Regel: dort war
+						--  gerade das fruehe Verschwinden bemaengelt worden
+						--  ("wenn ich nicht hingucke, gibt es die auch nicht").
+						--  Gemerkt wird der Versatz der Pill-MITTE gegen die
+						--  Box-Mitte (meist 0), nicht ihre linke Kante - die Box
+						--  waechst und schrumpft mit der Entfernung, der Versatz
+						--  kaum. Bei kollabierter Box (flach, 0x0) steht die Pill
+						--  bei minus ihrer halben Breite (siehe "kollabierte Box"
+						--  oben), dort wird sie mittig angenommen.
+						local pcx = PILLX[gui]
+						if not pcx or tNow - pcx.at > 0.25 then
+							pcx = pcx or {}
+							pcx.at, pcx.off, pcx.w = tNow, nil, nil
+							local pill = gui:FindFirstChild("Pill")
+							if pill and pill:IsA("GuiObject") then
+								local pas = pill.AbsoluteSize
+								if pas.X > 0 then
+									pcx.w = pas.X
+									pcx.off = flach and 0 or (pill.AbsolutePosition.X + pas.X * 0.5)
+										- (gui.AbsolutePosition.X + absSize.X * 0.5)
+								end
+							end
+							PILLX[gui] = pcx
+						end
+						local cx0, cw = rawX, bw
+						if pcx.w then cx0, cw = px + pcx.off - pcx.w * 0.5, pcx.w end
+						local sichtbar = cx0 >= -1 and cx0 + cw <= vpx + 1
 							and rawY + bh >= 0 and rawY >= -TAG_PUFFER_Y and rawY <= vpy
 						if not sichtbar then
 							nAusserhalb += 1
@@ -2560,10 +2868,20 @@ local function frameText(screen, tagsBody, sameScreen)
 		:format(num(os.clock() * 1000), num(vp.X), num(vp.Y))
 	--  EINE Verkettung fuer das ganze Paket, nicht Kopf + Panel + Tags in
 	--  Schritten (jeder Schritt waere eine weitere Kopie).
-	if sameScreen or screen == nil then
-		return head .. ',"sk":1,"w":[' .. (tagsBody or "") .. "]}"
+	--  KAMERAS GANZ AM ENDE (nach "s" und "w"): die App liest die erste eckige
+	--  Klammer als Panel (FrameStore.CarriesScreen) und die Kameras aus den letzten
+	--  Bytes, noch vor der Rueckstau-Bremse. Bei jedem Panel mit, sonst nur wenn
+	--  sich eine Kamera bewegt hat.
+	local cams = ""
+	if SC3.camDirty or not (sameScreen or screen == nil) then
+		local ct = SC3.camsText()
+		if ct then cams = "," .. ct end
+		SC3.camDirty = false
 	end
-	return head .. ',"s":' .. screen .. ',"w":[' .. (tagsBody or "") .. "]}"
+	if sameScreen or screen == nil then
+		return head .. ',"sk":1,"w":[' .. (tagsBody or "") .. "]" .. cams .. "}"
+	end
+	return head .. ',"s":' .. screen .. ',"w":[' .. (tagsBody or "") .. "]" .. cams .. "}"
 end
 
 --  Die Auswertung des Auto-Reglers (Erklaerung bei SP.setAuto oben). Laeuft
@@ -2793,6 +3111,10 @@ local function startLoop()
 				local scrolled = (pulse ~= lastPulse)
 				lastPulse = pulse
 				local changed = scrolled
+				--  Dreht oder zoomt jemand einen 3D-Render (ViewportFrame)? Das
+				--  loest KEINEN Panel-Durchlauf aus - die Kamera geht als eigenes
+				--  Feld mit (SC3.camDirty, frameText), das Panel bleibt "sk".
+				SC3.camChanged()
 
 				--  MAUS UEBER DEM PANEL: HOECHSTENS HOVER_HZ DURCHLAEUFE.
 				--
@@ -2975,10 +3297,10 @@ local function startLoop()
 				--  Nichts Neues? Dann geht auch nichts raus. Ein Paket, das
 				--  denselben Inhalt traegt wie das letzte, kostet auf beiden
 				--  Seiten Arbeit und aendert kein Pixel.
-				if n2 == 0 and not sendScreen then return end
+				if n2 == 0 and not sendScreen and not SC3.camDirty then return end
 				--  Ein Bild ohne neue Schild-Positionen UND ohne Panel-Aenderung
 				--  (gedrosselte Schild-Rate) hat nichts zu melden.
-				if not tagsFresh and not sendScreen then return end
+				if not tagsFresh and not sendScreen and not SC3.camDirty then return end
 
 				local nt0 = PROF.on and os.clock() or nil
 				local sc0 = os.clock()   -- immer an: Auto braucht die Kosten des Sendens
@@ -2989,6 +3311,9 @@ local function startLoop()
 				end
 
 				if useWs and sock then
+					--  Geometrie neuer 3D-Szenen VOR dem Bild, das auf sie verweist.
+					local nq = SC3.collect()
+					for qi = 1, nq do sock:Send(SC3.out[qi]) end
 					--  Direkt raus, ohne Sammelpuffer: das ist die Stelle,
 					--  an der die Echtzeit entsteht oder verloren geht.
 					sock:Send(payload)
@@ -3010,6 +3335,15 @@ local function startLoop()
 							--  und das auf dem Thread, der das Bild antreibt.
 							--  Kommt gar nichts zurueck (Programm weg, Port
 							--  tot), soll das hier scheitern, nicht haengen.
+							local nq = SC3.collect()
+							for qi = 1, nq do
+								pcall(req, {
+									Url = SP.BASE .. "/frame", Method = "POST",
+									Headers = { ["Content-Type"] = "application/json" },
+									Body = SC3.out[qi],
+									Timeout = 0.5,
+								})
+							end
 							local ok2 = pcall(req, {
 								Url = SP.BASE .. "/frame", Method = "POST",
 								Headers = { ["Content-Type"] = "application/json" },
@@ -3140,6 +3474,8 @@ function SP.setActive(on, reason)
 	SP.status = (SP.status == "lost") and "lost" or "off"
 	SP.fps, SP.prims, SP.panelPrims = 0, 0, 0
 	TAGC = {}   -- Schild-Inhalte nicht ueber das Abschalten hinaus festhalten
+	PILLX = {}
+	SC3.reset()
 
 	--  Die Verbindung SOFORT kappen, nicht erst wenn die Schleife das
 	--  naechste Mal drankommt. Solange sie steht, zeigt das Overlay das
